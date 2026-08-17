@@ -13,6 +13,14 @@ const ANIM_SIZE: f32 = 200.0;
 /// Wielkość czcionki w trybie working (domyślna w egui to ok. 14).
 const TEXT_SIZE: f32 = 20.0;
 
+/// Kolor czasu po wypełnieniu minimum. Czytelny i na jasnym, i na ciemnym motywie.
+const OVERTIME_COLOR: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
+
+/// Czy w trybie working natychmiast przywracać okno, gdy jednak zostanie
+/// zminimalizowane (np. przez Win+D albo Win+M, których przycisk nie blokuje).
+/// Domyślnie wyłączone - walczenie z użytkownikiem o okno bywa irytujące.
+const FORCE_RESTORE: bool = false;
+
 /// Ikona okna (pasek zadań, Alt+Tab). Kwadratowy PNG, najlepiej 256x256.
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
@@ -25,7 +33,10 @@ const EMBEDDED: &[(&str, &str, &[u8])] = &[
     ("idle", "gif", include_bytes!("../assets/idle.gif")),
     ("busy", "gif", include_bytes!("../assets/busy.gif")),
     ("pause", "gif", include_bytes!("../assets/pause.gif")),
+    ("overtime", "gif", include_bytes!("../assets/overtime.gif")),
 ];
+
+static APP_NAME: &str = "Nope, Finish This First!";
 
 fn main() -> eframe::Result {
     // Loadery egui zgłaszają błędy przez `log`. Bez zainicjowanego loggera
@@ -36,7 +47,7 @@ fn main() -> eframe::Result {
         .with_inner_size([640.0, 240.0])
         .with_resizable(false)
         .with_maximize_button(false)
-        .with_title("Task timer");
+        .with_title(APP_NAME);
 
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
@@ -62,41 +73,66 @@ fn main() -> eframe::Result {
 
 struct Task {
     name: String,
-    /// Moment zakończenia - do odliczania. Ma sens tylko gdy zadanie chodzi.
-    end: Instant,
-    /// Data i godzina zakończenia - gotowa do wyświetlenia.
+    /// Zadeklarowane minimum - po jego wypełnieniu liczymy dalej.
+    minimum: Duration,
+    /// Moment startu zadania.
+    started: Instant,
+    /// Suma zakończonych przerw.
+    paused_total: Duration,
+    /// Początek trwającej przerwy, jeśli akurat stoimy.
+    paused_at: Option<Instant>,
+    /// Data i godzina wypełnienia minimum - gotowa do wyświetlenia.
     end_label: String,
-    /// Gdy wstrzymane: ile czasu zostało w chwili naciśnięcia pauzy.
-    paused_left: Option<Duration>,
+    /// Czy zdążyliśmy już zasygnalizować osiągnięcie minimum.
+    notified: bool,
 }
 
 impl Task {
     fn is_paused(&self) -> bool {
-        self.paused_left.is_some()
+        self.paused_at.is_some()
     }
 
-    /// Ile jeszcze zostało. Podczas pauzy wartość zamrożona.
+    /// Faktycznie przepracowany czas, bez przerw. Podczas pauzy nie rośnie,
+    /// bo trwająca przerwa odejmuje się dokładnie tak szybko, jak przyrasta zegar.
+    fn worked(&self) -> Duration {
+        let paused = self.paused_total
+            + self
+                .paused_at
+                .map(|since| since.elapsed())
+                .unwrap_or_default();
+        self.started.elapsed().saturating_sub(paused)
+    }
+
+    /// Ile brakuje do minimum. Zero oznacza, że minimum wypełnione.
     fn remaining(&self) -> Duration {
-        match self.paused_left {
-            Some(left) => left,
-            None => self.end.saturating_duration_since(Instant::now()),
-        }
+        self.minimum.saturating_sub(self.worked())
+    }
+
+    /// Czy pracujemy już ponad zadeklarowane minimum.
+    fn is_overtime(&self) -> bool {
+        self.worked() >= self.minimum
     }
 
     fn pause(&mut self) {
         if !self.is_paused() {
-            self.paused_left = Some(self.remaining());
+            self.paused_at = Some(Instant::now());
         }
     }
 
     fn resume(&mut self) {
-        if let Some(left) = self.paused_left.take() {
-            // Koniec przesuwa się o całą długość przerwy.
-            self.end = Instant::now() + left;
-            let end_dt = Local::now()
-                + chrono::Duration::from_std(left).unwrap_or_else(|_| chrono::Duration::zero());
-            self.end_label = end_dt.format("%H:%M, %d.%m.%Y").to_string();
+        if let Some(since) = self.paused_at.take() {
+            self.paused_total += since.elapsed();
+            // Moment wypełnienia minimum przesuwa się o całą długość przerwy.
+            self.refresh_end_label();
         }
+    }
+
+    /// Przelicza godzinę, o której minimum zostanie wypełnione.
+    fn refresh_end_label(&mut self) {
+        let left = self.remaining();
+        let end_dt = Local::now()
+            + chrono::Duration::from_std(left).unwrap_or_else(|_| chrono::Duration::zero());
+        self.end_label = end_dt.format("%H:%M, %d.%m.%Y").to_string();
     }
 }
 
@@ -137,8 +173,14 @@ struct Anim {
 /// Dane trybu working przygotowane do wyświetlenia.
 struct WorkingView {
     name: String,
+    /// Etykieta drugiego wiersza - zmienia się po wypełnieniu minimum.
+    end_label: String,
     end: String,
-    left: String,
+    /// Etykieta trzeciego wiersza: "Pozostało" albo "Czas zadania".
+    time_label: String,
+    time_value: String,
+    /// Czy minimum jest już wypełnione (wtedy czas na zielono).
+    overtime: bool,
     paused: bool,
 }
 
@@ -147,49 +189,68 @@ struct App {
     dialog: Option<Dialog>,
     idle_anim: Anim,
     working_anim: Anim,
+    overtime_anim: Anim,
     pause_anim: Anim,
 }
 
 impl App {
     fn new(ctx: &egui::Context) -> Self {
+        let working_anim = load_anim(ctx, "busy");
+        // Brak osobnej animacji nadgodzin nie jest błędem - wtedy leci ta sama, co przy pracy.
+        let overtime_anim = match load_anim(ctx, "overtime") {
+            anim if anim.error.is_none() => anim,
+            _ => {
+                log::info!("Brak animacji overtime - używam working");
+                working_anim.clone()
+            }
+        };
+
         Self {
             state: State::Idle,
             dialog: None,
             idle_anim: load_anim(ctx, "idle"),
-            working_anim: load_anim(ctx, "busy"),
+            working_anim,
+            overtime_anim,
             pause_anim: load_anim(ctx, "pause"),
         }
     }
 
     fn start_task(&mut self, ctx: &egui::Context, name: String, minutes: u64) {
-        let end = Instant::now() + Duration::from_secs(minutes * 60);
+        let minimum = Duration::from_secs(minutes * 60);
         let end_dt = Local::now() + chrono::Duration::minutes(minutes as i64);
 
         self.state = State::Working(Task {
             name,
-            end,
+            minimum,
+            started: Instant::now(),
+            paused_total: Duration::ZERO,
+            paused_at: None,
             end_label: end_dt.format("%H:%M, %d.%m.%Y").to_string(),
-            paused_left: None,
+            notified: false,
         });
 
-        // Okno na wierzch na czas pracy.
+        // Okno na wierzch na czas pracy i bez możliwości schowania go w pasek zadań.
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
             egui::WindowLevel::AlwaysOnTop,
         ));
+        ctx.send_viewport_cmd(egui::ViewportCommand::EnableButtons {
+            close: true,
+            minimized: false,
+            maximize: false,
+        });
     }
 
-    fn back_to_idle(&mut self, ctx: &egui::Context, finished: bool) {
+    /// Zadanie kończy wyłącznie użytkownik przyciskiem "przerwij".
+    fn back_to_idle(&mut self, ctx: &egui::Context) {
         self.state = State::Idle;
 
-        // Zwolnij "zawsze na wierzchu" - okno może znów schować się pod inne.
+        // Zwolnij "zawsze na wierzchu" i przywróć minimalizowanie.
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
-
-        if finished {
-            // Delikatne mrugnięcie w pasku zadań, żeby nie przegapić końca.
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                egui::UserAttentionType::Informational,
-            ));
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::EnableButtons {
+            close: true,
+            minimized: true,
+            maximize: false,
+        });
     }
 }
 
@@ -200,13 +261,22 @@ impl eframe::App for App {
         // Context jest tanim uchwytem (Arc) - klonujemy, żeby nie kolidować z borrowem `ui`.
         let ctx = ui.ctx().clone();
 
-        // 1. Czy czas minął? Wstrzymane zadanie nigdy nie kończy się samo.
-        let finished = match &self.state {
-            State::Working(t) => !t.is_paused() && t.remaining().is_zero(),
-            State::Idle => false,
-        };
-        if finished {
-            self.back_to_idle(&ctx, true);
+        // 1. Minimum wypełnione? Nie kończymy zadania - tylko raz sygnalizujemy.
+        if let State::Working(t) = &mut self.state {
+            if !t.notified && t.is_overtime() {
+                t.notified = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
+            }
+        }
+
+        // Awaryjne przywracanie okna, jeśli mimo wyłączonego przycisku
+        // zostało zminimalizowane skrótem systemowym.
+        if FORCE_RESTORE && matches!(self.state, State::Working(_)) {
+            if ctx.input(|i| i.viewport().minimized) == Some(true) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            }
         }
 
         // 2. Przygotuj dane do wyświetlenia (żeby nie walczyć z borrow checkerem w domknięciach).
@@ -214,21 +284,36 @@ impl eframe::App for App {
         let anim = match &self.state {
             State::Idle => self.idle_anim.clone(),
             State::Working(t) if t.is_paused() => self.pause_anim.clone(),
+            State::Working(t) if t.is_overtime() => self.overtime_anim.clone(),
             State::Working(_) => self.working_anim.clone(),
         };
         let working_view = match &self.state {
             State::Working(t) => {
-                // Zaokrąglamy w górę: 44:01 pokazujemy jeszcze jako 45min.
-                let left_min = t.remaining().as_secs().div_ceil(60);
-                let end = if t.is_paused() {
-                    "wstrzymane".to_owned()
+                let overtime = t.is_overtime();
+
+                let (time_label, time_value) = if overtime {
+                    // Po wypełnieniu minimum: łączny przepracowany czas, w dół.
+                    ("Czas zadania:", fmt_minutes(t.worked().as_secs() / 60))
                 } else {
-                    t.end_label.clone()
+                    // Przed: ile brakuje, w górę (44:01 to jeszcze 45min).
+                    ("Pozostało:", fmt_minutes(t.remaining().as_secs().div_ceil(60)))
                 };
+
+                let (end_label, end) = if overtime {
+                    ("Minimum od:", t.end_label.clone())
+                } else if t.is_paused() {
+                    ("Koniec:", "wstrzymane".to_owned())
+                } else {
+                    ("Koniec:", t.end_label.clone())
+                };
+
                 Some(WorkingView {
                     name: t.name.clone(),
+                    end_label: end_label.to_owned(),
                     end,
-                    left: fmt_minutes(left_min),
+                    time_label: time_label.to_owned(),
+                    time_value,
+                    overtime,
                     paused: t.is_paused(),
                 })
             }
@@ -278,8 +363,12 @@ impl eframe::App for App {
                         Some(view) => {
                             ui.spacing_mut().item_spacing.y = 8.0;
                             row(ui, "Bieżące zadanie:", &view.name);
-                            row(ui, "Koniec:", &view.end);
-                            row(ui, "Pozostało:", &view.left);
+                            row(ui, &view.end_label, &view.end);
+                            if view.overtime {
+                                row_colored(ui, &view.time_label, &view.time_value, OVERTIME_COLOR);
+                            } else {
+                                row(ui, &view.time_label, &view.time_value);
+                            }
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 let label = if view.paused { "wznów" } else { "pauza" };
@@ -412,16 +501,22 @@ impl eframe::App for App {
             }
         }
         if abort {
-            self.back_to_idle(&ctx, false);
+            self.back_to_idle(&ctx);
         }
 
         // 6. Odświeżanie: obudź się dokładnie wtedy, gdy zmieni się wyświetlana minuta.
         // Podczas pauzy nic nie tyka, więc nie ma po co budzić UI.
         if let State::Working(t) = &self.state {
             if !t.is_paused() {
-                let secs = t.remaining().as_secs();
-                let shown_min = secs.div_ceil(60);
-                let wait = secs - 60 * shown_min.saturating_sub(1);
+                let wait = if t.is_overtime() {
+                    // Liczymy w górę, minuty zaokrąglane w dół.
+                    60 - t.worked().as_secs() % 60
+                } else {
+                    // Liczymy w dół, minuty zaokrąglane w górę.
+                    let secs = t.remaining().as_secs();
+                    let shown_min = secs.div_ceil(60);
+                    secs - 60 * shown_min.saturating_sub(1)
+                };
                 ctx.request_repaint_after(Duration::from_secs(wait.clamp(1, 60)));
             }
         }
@@ -454,6 +549,19 @@ fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).strong().size(TEXT_SIZE));
         ui.label(egui::RichText::new(value).size(TEXT_SIZE));
+    });
+}
+
+/// Wiersz z wyróżnioną kolorem wartością.
+fn row_colored(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).strong().size(TEXT_SIZE));
+        ui.label(
+            egui::RichText::new(value)
+                .strong()
+                .size(TEXT_SIZE)
+                .color(color),
+        );
     });
 }
 
