@@ -8,6 +8,7 @@ eframe = "0.36"
 egui_extras = { version = "0.36", features = ["image", "gif", "webp"] }
 image = { version = "0.25", features = ["gif", "webp", "png"] }
 chrono = "0.4"
+rfd = "0.17"
 log = "0.4"
 env_logger = "0.11"
 

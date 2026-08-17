@@ -73,10 +73,14 @@ fn main() -> eframe::Result {
 
 struct Task {
     name: String,
+    /// Etykieta do grupowania zadań w analizie. Może być pusta.
+    tag: String,
     /// Zadeklarowane minimum - po jego wypełnieniu liczymy dalej.
     minimum: Duration,
     /// Moment startu zadania.
     started: Instant,
+    /// Moment startu wg zegara ściennego - do logu.
+    started_at: chrono::DateTime<Local>,
     /// Suma zakończonych przerw.
     paused_total: Duration,
     /// Początek trwającej przerwy, jeśli akurat stoimy.
@@ -101,6 +105,15 @@ impl Task {
                 .map(|since| since.elapsed())
                 .unwrap_or_default();
         self.started.elapsed().saturating_sub(paused)
+    }
+
+    /// Łączny czas przerw, wliczając trwającą.
+    fn paused_time(&self) -> Duration {
+        self.paused_total
+            + self
+                .paused_at
+                .map(|since| since.elapsed())
+                .unwrap_or_default()
     }
 
     /// Ile brakuje do minimum. Zero oznacza, że minimum wypełnione.
@@ -144,6 +157,7 @@ enum State {
 /// Stan okienka dialogowego "nowe zadanie".
 struct Dialog {
     name: String,
+    tag: String,
     time: String,
     error: Option<String>,
     /// Czy w tej klatce ustawić fokus na pierwszym polu.
@@ -154,6 +168,7 @@ impl Default for Dialog {
     fn default() -> Self {
         Self {
             name: String::new(),
+            tag: String::new(),
             time: String::new(),
             error: None,
             focus_name: true,
@@ -191,6 +206,10 @@ struct App {
     working_anim: Anim,
     overtime_anim: Anim,
     pause_anim: Anim,
+    /// Plik CSV z logiem. None = logowanie nieaktywne.
+    log_path: Option<PathBuf>,
+    /// Komunikat po ostatniej próbie zapisu.
+    log_status: Option<String>,
 }
 
 impl App {
@@ -212,17 +231,22 @@ impl App {
             working_anim,
             overtime_anim,
             pause_anim: load_anim(ctx, "pause"),
+            log_path: None,
+            log_status: None,
         }
     }
 
-    fn start_task(&mut self, ctx: &egui::Context, name: String, minutes: u64) {
+    fn start_task(&mut self, ctx: &egui::Context, name: String, tag: String, minutes: u64) {
         let minimum = Duration::from_secs(minutes * 60);
-        let end_dt = Local::now() + chrono::Duration::minutes(minutes as i64);
+        let now = Local::now();
+        let end_dt = now + chrono::Duration::minutes(minutes as i64);
 
         self.state = State::Working(Task {
             name,
+            tag,
             minimum,
             started: Instant::now(),
+            started_at: now,
             paused_total: Duration::ZERO,
             paused_at: None,
             end_label: end_dt.format("%H:%M, %d.%m.%Y").to_string(),
@@ -323,6 +347,10 @@ impl eframe::App for App {
         let mut open_dialog = false;
         let mut abort = false;
         let mut toggle_pause = false;
+        let mut pick_log = false;
+        let mut clear_log = false;
+        let log_path = self.log_path.clone();
+        let log_status = self.log_status.clone();
 
         // 3. Okno główne.
         egui::CentralPanel::default().show(ui, |ui| {
@@ -350,7 +378,11 @@ impl eframe::App for App {
 
                 // Prawa strona: zależnie od stanu.
                 ui.vertical(|ui| {
-                    ui.add_space(ANIM_SIZE / 2.0 - 46.0);
+                    ui.add_space(if working_view.is_some() {
+                        ANIM_SIZE / 2.0 - 46.0
+                    } else {
+                        ANIM_SIZE / 2.0 - 58.0
+                    });
                     match &working_view {
                         None => {
                             if ui
@@ -358,6 +390,47 @@ impl eframe::App for App {
                                 .clicked()
                             {
                                 open_dialog = true;
+                            }
+
+                            ui.add_space(14.0);
+
+                            ui.horizontal(|ui| {
+                                if ui.button("plik logu…").clicked() {
+                                    pick_log = true;
+                                }
+                                if log_path.is_some() && ui.button("wyłącz").clicked() {
+                                    clear_log = true;
+                                }
+                            });
+
+                            match &log_path {
+                                Some(path) => {
+                                    let name = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| path.display().to_string());
+                                    ui.label(
+                                        egui::RichText::new(format!("zapis do: {name}"))
+                                            .small()
+                                            .color(OVERTIME_COLOR),
+                                    )
+                                    .on_hover_text(path.display().to_string());
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new("logowanie nieaktywne")
+                                            .small()
+                                            .weak(),
+                                    );
+                                }
+                            }
+
+                            if let Some(status) = &log_status {
+                                ui.label(
+                                    egui::RichText::new(status)
+                                        .small()
+                                        .color(egui::Color32::from_rgb(220, 80, 80)),
+                                );
                             }
                         }
                         Some(view) => {
@@ -416,6 +489,14 @@ impl eframe::App for App {
                             }
                             ui.end_row();
 
+                            ui.label("Tag:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut d.tag)
+                                    .hint_text("do grupowania, opcjonalny")
+                                    .desired_width(200.0),
+                            );
+                            ui.end_row();
+
                             ui.label("Czas:");
                             ui.add(
                                 egui::TextEdit::singleline(&mut d.time)
@@ -466,19 +547,18 @@ impl eframe::App for App {
             self.dialog = None;
         }
         if submit {
-            let parsed = self
-                .dialog
-                .as_ref()
-                .and_then(|d| parse_duration_minutes(&d.time).map(|m| (d.name.clone(), m)));
+            let parsed = self.dialog.as_ref().and_then(|d| {
+                parse_duration_minutes(&d.time).map(|m| (d.name.clone(), d.tag.clone(), m))
+            });
 
             match parsed {
-                Some((name, minutes)) => {
+                Some((name, tag, minutes)) => {
                     let name = if name.trim().is_empty() {
                         "(bez nazwy)".to_owned()
                     } else {
                         name.trim().to_owned()
                     };
-                    self.start_task(&ctx, name, minutes);
+                    self.start_task(&ctx, name, tag.trim().to_owned(), minutes);
                     self.dialog = None;
                 }
                 None => {
@@ -501,7 +581,52 @@ impl eframe::App for App {
             }
         }
         if abort {
+            // Zapis PRZED zmianą stanu - potem zadania już nie ma.
+            if let State::Working(t) = &self.state {
+                if let Some(path) = self.log_path.clone() {
+                    match append_log(&path, t) {
+                        Ok(()) => {
+                            log::info!("zapisano do logu: {}", path.display());
+                            self.log_status = None;
+                        }
+                        Err(err) => {
+                            log::error!("zapis do logu nieudany: {err}");
+                            self.log_status = Some(format!("Błąd zapisu: {err}"));
+                        }
+                    }
+                }
+            }
             self.back_to_idle(&ctx);
+        }
+
+        if pick_log {
+            // Dialog systemowy blokuje wątek UI aż do wyboru - to jest OK,
+            // bo i tak nie ma co odświeżać w tle.
+            let mut chooser = rfd::FileDialog::new()
+                .set_title("Plik logu zadań")
+                .add_filter("CSV", &["csv"]);
+            chooser = match &self.log_path {
+                Some(current) => {
+                    let dir = current.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    chooser.set_directory(dir).set_file_name(
+                        current
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    )
+                }
+                None => chooser.set_file_name("zadania.csv"),
+            };
+            if let Some(path) = chooser.save_file() {
+                log::info!("plik logu: {}", path.display());
+                self.log_path = Some(path);
+                self.log_status = None;
+            }
+        }
+
+        if clear_log {
+            self.log_path = None;
+            self.log_status = None;
         }
 
         // 6. Odświeżanie: obudź się dokładnie wtedy, gdy zmieni się wyświetlana minuta.
@@ -521,6 +646,58 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------- log CSV
+
+/// Nagłówek pisany tylko przy zakładaniu nowego (pustego) pliku.
+const CSV_HEADER: &str = "started_at,ended_at,task,tag,minimum_min,worked_min,paused_min";
+
+/// Otacza pole cudzysłowami, jeśli zawiera przecinek, cudzysłów albo nową linię.
+/// Cudzysłowy w środku podwajamy - tak wymaga RFC 4180 i tak czyta to pandas.
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Sekundy na minuty, zaokrąglane do najbliższej.
+fn to_minutes(d: Duration) -> u64 {
+    (d.as_secs() + 30) / 60
+}
+
+/// Dopisuje jeden wiersz na koniec pliku. Zakłada plik i nagłówek, jeśli trzeba.
+fn append_log(path: &std::path::Path, task: &Task) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let fresh = match std::fs::metadata(path) {
+        Ok(meta) => meta.len() == 0,
+        Err(_) => true,
+    };
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+
+    if fresh {
+        writeln!(file, "{CSV_HEADER}")?;
+    }
+
+    let fmt = "%Y-%m-%d %H:%M:%S";
+    writeln!(
+        file,
+        "{},{},{},{},{},{},{}",
+        task.started_at.format(fmt),
+        Local::now().format(fmt),
+        csv_field(&task.name),
+        csv_field(&task.tag),
+        to_minutes(task.minimum),
+        to_minutes(task.worked()),
+        to_minutes(task.paused_time()),
+    )
 }
 
 // ---------------------------------------------------------------- pomocnicze
