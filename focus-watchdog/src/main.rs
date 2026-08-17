@@ -13,6 +13,9 @@ const ANIM_SIZE: f32 = 200.0;
 /// Wielkość czcionki w trybie working (domyślna w egui to ok. 14).
 const TEXT_SIZE: f32 = 20.0;
 
+/// Ikona okna (pasek zadań, Alt+Tab). Kwadratowy PNG, najlepiej 256x256.
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+
 /// Animacje wkompilowane w binarkę na etapie `cargo build`.
 ///
 /// Ścieżki są względne do tego pliku (`src/main.rs`), więc pliki muszą istnieć
@@ -30,16 +33,22 @@ fn main() -> eframe::Result {
     // komunikaty typu "nie znalazłem pliku" znikają w próżni.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([640.0, 240.0])
+        .with_min_inner_size([520.0, 240.0])
+        .with_title(APP_NAME);
+
+    if let Some(icon) = load_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 240.0])
-            .with_min_inner_size([520.0, 240.0])
-            .with_title(APP_NAME),
+        viewport,
         ..Default::default()
     };
 
     eframe::run_native(
-        APP_NAME,
+        "Task timer",
         options,
         Box::new(|cc| {
             // Bez tego obrazki się nie załadują.
@@ -106,7 +115,7 @@ impl App {
             state: State::Idle,
             dialog: None,
             idle_anim: load_anim(ctx, "idle"),
-            working_anim: load_anim(ctx, "working"),
+            working_anim: load_anim(ctx, "busy"),
         }
     }
 
@@ -341,6 +350,26 @@ impl eframe::App for App {
 }
 
 // ---------------------------------------------------------------- pomocnicze
+
+/// Dekoduje wbudowany PNG do formatu, którego oczekuje egui.
+/// Zwraca None zamiast panikować - brak ikony to nie powód, żeby apka nie wstała.
+fn load_icon() -> Option<egui::IconData> {
+    match image::load_from_memory(ICON_PNG) {
+        Ok(img) => {
+            let img = img.into_rgba8();
+            let (width, height) = img.dimensions();
+            Some(egui::IconData {
+                rgba: img.into_raw(),
+                width,
+                height,
+            })
+        }
+        Err(err) => {
+            log::error!("Nie mogę zdekodować ikony: {err}");
+            None
+        }
+    }
+}
 
 fn row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
