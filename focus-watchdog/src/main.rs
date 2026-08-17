@@ -22,11 +22,10 @@ const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 /// pod `assets/` już w czasie kompilacji - inaczej dostaniesz błąd kompilatora.
 /// Zmieniasz format? Popraw i rozszerzenie w pierwszej kolumnie, i ścieżkę.
 const EMBEDDED: &[(&str, &str, &[u8])] = &[
-    ("idle", "gif", include_bytes!("..\\assets\\idle.gif")),
-    ("working", "gif", include_bytes!("..\\assets\\busy.gif")),
+    ("idle", "gif", include_bytes!("../assets/idle.gif")),
+    ("busy", "gif", include_bytes!("../assets/busy.gif")),
+    ("pause", "gif", include_bytes!("../assets/pause.gif")),
 ];
-
-static APP_NAME: &str = "Nope, Finish This First!";
 
 fn main() -> eframe::Result {
     // Loadery egui zgłaszają błędy przez `log`. Bez zainicjowanego loggera
@@ -35,8 +34,9 @@ fn main() -> eframe::Result {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([640.0, 240.0])
-        .with_min_inner_size([520.0, 240.0])
-        .with_title(APP_NAME);
+        .with_resizable(false)
+        .with_maximize_button(false)
+        .with_title("Task timer");
 
     if let Some(icon) = load_icon() {
         viewport = viewport.with_icon(icon);
@@ -62,10 +62,42 @@ fn main() -> eframe::Result {
 
 struct Task {
     name: String,
-    /// Moment zakończenia - do odliczania.
+    /// Moment zakończenia - do odliczania. Ma sens tylko gdy zadanie chodzi.
     end: Instant,
     /// Data i godzina zakończenia - gotowa do wyświetlenia.
     end_label: String,
+    /// Gdy wstrzymane: ile czasu zostało w chwili naciśnięcia pauzy.
+    paused_left: Option<Duration>,
+}
+
+impl Task {
+    fn is_paused(&self) -> bool {
+        self.paused_left.is_some()
+    }
+
+    /// Ile jeszcze zostało. Podczas pauzy wartość zamrożona.
+    fn remaining(&self) -> Duration {
+        match self.paused_left {
+            Some(left) => left,
+            None => self.end.saturating_duration_since(Instant::now()),
+        }
+    }
+
+    fn pause(&mut self) {
+        if !self.is_paused() {
+            self.paused_left = Some(self.remaining());
+        }
+    }
+
+    fn resume(&mut self) {
+        if let Some(left) = self.paused_left.take() {
+            // Koniec przesuwa się o całą długość przerwy.
+            self.end = Instant::now() + left;
+            let end_dt = Local::now()
+                + chrono::Duration::from_std(left).unwrap_or_else(|_| chrono::Duration::zero());
+            self.end_label = end_dt.format("%H:%M, %d.%m.%Y").to_string();
+        }
+    }
 }
 
 enum State {
@@ -102,11 +134,20 @@ struct Anim {
     error: Option<String>,
 }
 
+/// Dane trybu working przygotowane do wyświetlenia.
+struct WorkingView {
+    name: String,
+    end: String,
+    left: String,
+    paused: bool,
+}
+
 struct App {
     state: State,
     dialog: Option<Dialog>,
     idle_anim: Anim,
     working_anim: Anim,
+    pause_anim: Anim,
 }
 
 impl App {
@@ -116,6 +157,7 @@ impl App {
             dialog: None,
             idle_anim: load_anim(ctx, "idle"),
             working_anim: load_anim(ctx, "busy"),
+            pause_anim: load_anim(ctx, "pause"),
         }
     }
 
@@ -127,6 +169,7 @@ impl App {
             name,
             end,
             end_label: end_dt.format("%H:%M, %d.%m.%Y").to_string(),
+            paused_left: None,
         });
 
         // Okno na wierzch na czas pracy.
@@ -157,9 +200,9 @@ impl eframe::App for App {
         // Context jest tanim uchwytem (Arc) - klonujemy, żeby nie kolidować z borrowem `ui`.
         let ctx = ui.ctx().clone();
 
-        // 1. Czy czas minął?
+        // 1. Czy czas minął? Wstrzymane zadanie nigdy nie kończy się samo.
         let finished = match &self.state {
-            State::Working(t) => Instant::now() >= t.end,
+            State::Working(t) => !t.is_paused() && t.remaining().is_zero(),
             State::Idle => false,
         };
         if finished {
@@ -167,22 +210,34 @@ impl eframe::App for App {
         }
 
         // 2. Przygotuj dane do wyświetlenia (żeby nie walczyć z borrow checkerem w domknięciach).
+        // Podczas pauzy wracamy do animacji idle - widać stan jednym rzutem oka.
         let anim = match &self.state {
             State::Idle => self.idle_anim.clone(),
+            State::Working(t) if t.is_paused() => self.pause_anim.clone(),
             State::Working(_) => self.working_anim.clone(),
         };
         let working_view = match &self.state {
             State::Working(t) => {
-                let left_secs = t.end.saturating_duration_since(Instant::now()).as_secs();
                 // Zaokrąglamy w górę: 44:01 pokazujemy jeszcze jako 45min.
-                let left_min = left_secs.div_ceil(60);
-                Some((t.name.clone(), t.end_label.clone(), fmt_minutes(left_min)))
+                let left_min = t.remaining().as_secs().div_ceil(60);
+                let end = if t.is_paused() {
+                    "wstrzymane".to_owned()
+                } else {
+                    t.end_label.clone()
+                };
+                Some(WorkingView {
+                    name: t.name.clone(),
+                    end,
+                    left: fmt_minutes(left_min),
+                    paused: t.is_paused(),
+                })
             }
             State::Idle => None,
         };
 
         let mut open_dialog = false;
         let mut abort = false;
+        let mut toggle_pause = false;
 
         // 3. Okno główne.
         egui::CentralPanel::default().show(ui, |ui| {
@@ -220,15 +275,27 @@ impl eframe::App for App {
                                 open_dialog = true;
                             }
                         }
-                        Some((name, end, left)) => {
+                        Some(view) => {
                             ui.spacing_mut().item_spacing.y = 8.0;
-                            row(ui, "Bieżące zadanie:", name);
-                            row(ui, "Koniec:", end);
-                            row(ui, "Pozostało:", left);
+                            row(ui, "Bieżące zadanie:", &view.name);
+                            row(ui, "Koniec:", &view.end);
+                            row(ui, "Pozostało:", &view.left);
                             ui.add_space(6.0);
-                            if ui.small_button("przerwij").clicked() {
-                                abort = true;
-                            }
+                            ui.horizontal(|ui| {
+                                let label = if view.paused { "wznów" } else { "pauza" };
+                                if ui
+                                    .add_sized([90.0, 28.0], egui::Button::new(label))
+                                    .clicked()
+                                {
+                                    toggle_pause = true;
+                                }
+                                if ui
+                                    .add_sized([90.0, 28.0], egui::Button::new("zakończ"))
+                                    .clicked() 
+                                {
+                                    abort = true;
+                                }
+                            });
                         }
                     }
                 });
@@ -335,16 +402,28 @@ impl eframe::App for App {
                 }
             }
         }
+        if toggle_pause {
+            if let State::Working(t) = &mut self.state {
+                if t.is_paused() {
+                    t.resume();
+                } else {
+                    t.pause();
+                }
+            }
+        }
         if abort {
             self.back_to_idle(&ctx, false);
         }
 
         // 6. Odświeżanie: obudź się dokładnie wtedy, gdy zmieni się wyświetlana minuta.
+        // Podczas pauzy nic nie tyka, więc nie ma po co budzić UI.
         if let State::Working(t) = &self.state {
-            let secs = t.end.saturating_duration_since(Instant::now()).as_secs();
-            let shown_min = secs.div_ceil(60);
-            let wait = secs - 60 * shown_min.saturating_sub(1);
-            ctx.request_repaint_after(Duration::from_secs(wait.clamp(1, 60)));
+            if !t.is_paused() {
+                let secs = t.remaining().as_secs();
+                let shown_min = secs.div_ceil(60);
+                let wait = secs - 60 * shown_min.saturating_sub(1);
+                ctx.request_repaint_after(Duration::from_secs(wait.clamp(1, 60)));
+            }
         }
     }
 }
