@@ -1,0 +1,10 @@
+[package]
+name = "hello-world"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+askama = "0.16.0"
+askama_web = { version = "0.16.0", features = ["axum-0.8"] }
+axum = "0.8.9"
+tokio = { version = "1.52.3", features = ["full"] }
