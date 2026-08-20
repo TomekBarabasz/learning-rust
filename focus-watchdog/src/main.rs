@@ -13,6 +13,12 @@ const ANIM_SIZE: f32 = 200.0;
 /// Wielkość czcionki w trybie working (domyślna w egui to ok. 14).
 const TEXT_SIZE: f32 = 20.0;
 
+/// Wysokość przycisków i comboboxa w wierszu akcji.
+const BUTTON_H: f32 = 28.0;
+
+/// Warianty przedłużenia sesji, w minutach.
+const EXTEND_OPTIONS: [u64; 3] = [15, 30, 45];
+
 /// Kolor czasu po wypełnieniu minimum. Czytelny i na jasnym, i na ciemnym motywie.
 const OVERTIME_COLOR: egui::Color32 = egui::Color32::from_rgb(46, 160, 67);
 
@@ -126,6 +132,14 @@ impl Task {
         self.worked() >= self.minimum
     }
 
+    /// Przedłuża zobowiązanie o zadany czas, licząc od teraz.
+    /// Sesja biegnie dalej bez resetu - zmienia się tylko to, do czego się zobowiązujemy.
+    fn extend(&mut self, extra: Duration) {
+        self.minimum = self.worked() + extra;
+        self.notified = false;
+        self.refresh_end_label();
+    }
+
     fn pause(&mut self) {
         if !self.is_paused() {
             self.paused_at = Some(Instant::now());
@@ -191,10 +205,11 @@ struct WorkingView {
     /// Etykieta drugiego wiersza - zmienia się po wypełnieniu minimum.
     end_label: String,
     end: String,
-    /// Etykieta trzeciego wiersza: "Pozostało" albo "Czas zadania".
-    time_label: String,
-    time_value: String,
-    /// Czy minimum jest już wypełnione (wtedy czas na zielono).
+    /// Czas od startu sesji, bez przerw. Widoczny zawsze.
+    session: String,
+    /// Ile zostało do wypełnienia zobowiązania. None w stanie overtime.
+    remaining: Option<String>,
+    /// Czy minimum jest już wypełnione (wtedy czas sesji na zielono).
     overtime: bool,
     paused: bool,
 }
@@ -315,13 +330,14 @@ impl eframe::App for App {
             State::Working(t) => {
                 let overtime = t.is_overtime();
 
-                let (time_label, time_value) = if overtime {
-                    // Po wypełnieniu minimum: łączny przepracowany czas, w dół.
-                    ("Czas zadania:", fmt_minutes(t.worked().as_secs() / 60))
-                } else {
-                    // Przed: ile brakuje, w górę (44:01 to jeszcze 45min).
-                    ("Pozostało:", fmt_minutes(t.remaining().as_secs().div_ceil(60)))
-                };
+                // Czas sesji biegnie zawsze, także po wypełnieniu minimum
+                // i po przedłużeniu. Zaokrąglany w dół - "tyle już mam".
+                let session = fmt_minutes(t.worked().as_secs() / 60);
+
+                // Zostało tylko dopóki zobowiązanie niewypełnione.
+                // W górę, żeby 44:01 pokazać jeszcze jako 45min.
+                let remaining = (!overtime)
+                    .then(|| fmt_minutes(t.remaining().as_secs().div_ceil(60)));
 
                 let (end_label, end) = if overtime {
                     ("Minimum od:", t.end_label.clone())
@@ -335,8 +351,8 @@ impl eframe::App for App {
                     name: t.name.clone(),
                     end_label: end_label.to_owned(),
                     end,
-                    time_label: time_label.to_owned(),
-                    time_value,
+                    session,
+                    remaining,
                     overtime,
                     paused: t.is_paused(),
                 })
@@ -349,6 +365,7 @@ impl eframe::App for App {
         let mut toggle_pause = false;
         let mut pick_log = false;
         let mut clear_log = false;
+        let mut extend: Option<u64> = None;
         let log_path = self.log_path.clone();
         let log_status = self.log_status.clone();
 
@@ -378,10 +395,12 @@ impl eframe::App for App {
 
                 // Prawa strona: zależnie od stanu.
                 ui.vertical(|ui| {
-                    ui.add_space(if working_view.is_some() {
-                        ANIM_SIZE / 2.0 - 46.0
-                    } else {
-                        ANIM_SIZE / 2.0 - 58.0
+                    // Wyśrodkowanie względem animacji: każdy stan ma inną wysokość treści.
+                    ui.add_space(match &working_view {
+                        None => ANIM_SIZE / 2.0 - 58.0,
+                        // Busy ma cztery wiersze, overtime trzy.
+                        Some(v) if v.remaining.is_some() => ANIM_SIZE / 2.0 - 84.0,
+                        Some(_) => ANIM_SIZE / 2.0 - 66.0,
                     });
                     match &working_view {
                         None => {
@@ -438,24 +457,53 @@ impl eframe::App for App {
                             row(ui, "Bieżące zadanie:", &view.name);
                             row(ui, &view.end_label, &view.end);
                             if view.overtime {
-                                row_colored(ui, &view.time_label, &view.time_value, OVERTIME_COLOR);
+                                row_colored(ui, "Czas sesji:", &view.session, OVERTIME_COLOR);
                             } else {
-                                row(ui, &view.time_label, &view.time_value);
+                                row(ui, "Czas sesji:", &view.session);
+                            }
+                            if let Some(left) = &view.remaining {
+                                row(ui, "Pozostało:", left);
                             }
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 let label = if view.paused { "wznów" } else { "pauza" };
                                 if ui
-                                    .add_sized([90.0, 28.0], egui::Button::new(label))
+                                    .add_sized([90.0, BUTTON_H], egui::Button::new(label))
                                     .clicked()
                                 {
                                     toggle_pause = true;
                                 }
                                 if ui
-                                    .add_sized([90.0, 28.0], egui::Button::new("zakończ"))
+                                    .add_sized([90.0, BUTTON_H], egui::Button::new("zakończ"))
                                     .clicked() 
                                 {
                                     abort = true;
+                                }
+                                // Przedłużenie ma sens dopiero, gdy zobowiązanie wypełnione.
+                                if view.overtime {
+                                    // ComboBox nie przyjmuje add_sized - wysokość bierze
+                                    // ze stylu. Zmiana dotyczy tylko tego wiersza.
+                                    let text_h = ui.text_style_height(&egui::TextStyle::Button);
+                                    ui.spacing_mut().interact_size.y = BUTTON_H;
+                                    ui.spacing_mut().button_padding.y =
+                                        ((BUTTON_H - text_h) / 2.0).max(0.0);
+
+                                    egui::ComboBox::from_id_salt("extend")
+                                        .selected_text("przedłuż")
+                                        .width(110.0)
+                                        .show_ui(ui, |ui| {
+                                            for minutes in EXTEND_OPTIONS {
+                                                if ui
+                                                    .selectable_label(
+                                                        false,
+                                                        format!("+{minutes} min"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    extend = Some(minutes);
+                                                }
+                                            }
+                                        });
                                 }
                             });
                         }
@@ -580,6 +628,13 @@ impl eframe::App for App {
                 }
             }
         }
+        if let Some(minutes) = extend {
+            if let State::Working(t) = &mut self.state {
+                t.extend(Duration::from_secs(minutes * 60));
+                log::info!("sesja przedłużona o {minutes} min");
+            }
+        }
+
         if abort {
             // Zapis PRZED zmianą stanu - potem zadania już nie ma.
             if let State::Working(t) = &self.state {
@@ -630,18 +685,23 @@ impl eframe::App for App {
         }
 
         // 6. Odświeżanie: obudź się dokładnie wtedy, gdy zmieni się wyświetlana minuta.
+        // W stanie busy tykają dwa liczniki - bierzemy wcześniejszy z nich.
         // Podczas pauzy nic nie tyka, więc nie ma po co budzić UI.
         if let State::Working(t) = &self.state {
             if !t.is_paused() {
+                // Czas sesji rośnie i jest zaokrąglany w dół.
+                let session_wait = 60 - t.worked().as_secs() % 60;
+
                 let wait = if t.is_overtime() {
-                    // Liczymy w górę, minuty zaokrąglane w dół.
-                    60 - t.worked().as_secs() % 60
+                    session_wait
                 } else {
-                    // Liczymy w dół, minuty zaokrąglane w górę.
+                    // Pozostało maleje i jest zaokrąglane w górę.
                     let secs = t.remaining().as_secs();
                     let shown_min = secs.div_ceil(60);
-                    secs - 60 * shown_min.saturating_sub(1)
+                    let remaining_wait = secs - 60 * shown_min.saturating_sub(1);
+                    session_wait.min(remaining_wait)
                 };
+
                 ctx.request_repaint_after(Duration::from_secs(wait.clamp(1, 60)));
             }
         }
