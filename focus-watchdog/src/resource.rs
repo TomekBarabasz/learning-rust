@@ -11,7 +11,8 @@ pub struct Anim {
     pub error: Option<String>,
 }
 
-/// Animacje wkompilowane w binarkę na etapie `cargo build`.
+// Animacje wkompilowane w binarkę na etapie 'cargo build'.
+
 include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 
 /// Ikona okna (pasek zadań, Alt+Tab). Kwadratowy PNG, najlepiej 256x256.

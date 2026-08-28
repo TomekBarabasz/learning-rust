@@ -84,6 +84,9 @@ fn init_logging() {
 }
 /// Plik logu obok pliku wykonywalnego.
 #[cfg(not(debug_assertions))]
+use std::path::PathBuf;
+
+#[cfg(not(debug_assertions))]
 fn log_file_path() -> Option<PathBuf> {
     Some(env::current_exe().ok()?.with_extension("log"))
 }
