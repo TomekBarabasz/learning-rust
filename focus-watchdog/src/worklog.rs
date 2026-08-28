@@ -15,6 +15,7 @@ pub struct WorklogTask {
 }
 
 pub trait Worklog {
+    fn get_name(&self) -> String;
     fn add_record(&mut self, task: &Task) -> Result<()>;
     fn get_task_names(&self) -> Result<Vec<WorklogTask>>;
     fn get_top_tasks(&self) -> Result<Vec<WorklogTask>>;
@@ -59,6 +60,9 @@ impl FileWorklog {
 }
 
 impl Worklog for FileWorklog {
+    fn get_name(&self) -> String {
+        format!("Logowanie do pliku {:?}",self.path)
+    }
     fn add_record(&mut self, task: &Task) -> Result<()> {
         use std::io::Write as _;
 
@@ -119,6 +123,9 @@ impl RemoteWorklog {
 }
 
 impl Worklog for RemoteWorklog {
+    fn get_name(&self) -> String {
+        format!("Logowanie na serwer {}",self.url)
+    }
     fn add_record(&mut self, task: &Task) -> Result<()> {
         // TODO: sprawdzić w sb-client jak to zformatować poprawnie żeby Lua się nie pluło
         let record = format!(
@@ -194,6 +201,9 @@ impl DummyWorklog {
     }
 }
 impl Worklog for DummyWorklog {
+    fn get_name(&self) -> String {
+        format!("Logowanie wyłączone")
+    }
     fn add_record(&mut self, _task: &Task) -> Result<()> {
         Ok(())
     }

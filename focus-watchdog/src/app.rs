@@ -9,10 +9,32 @@ use crate::utils::{fmt_minutes, parse_duration_minutes};
 use crate::worklog::Worklog;
 use crate::config::AppConfig;
 
+/// Kolor komunikatów o błędach (brak animacji, zły format czasu, zapis do logu).
+const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
+
 pub enum SessionState {
     Idle,
     Working(Task),
 }
+
+/// Co użytkownik zrobił w tej klatce.
+///
+/// Rysowanie tylko zaznacza flagi, a zmiany stanu dzieją się później,
+/// w `apply`. Dzięki temu domknięcia egui nie muszą trzymać `&mut self`
+/// i nie ma walki z borrow checkerem.
+#[derive(Default)]
+struct Actions {
+    open_dialog: bool,
+    submit: bool,
+    cancel: bool,
+    toggle_pause: bool,
+    extend: Option<u64>,
+    abort: bool,
+    pick_log: bool,
+    clear_log: bool,
+}
+
+// ---------------------------------------------------------------- dialog ---
 
 /// Stan okienka dialogowego "nowe zadanie".
 struct Dialog {
@@ -36,6 +58,92 @@ impl Default for Dialog {
     }
 }
 
+impl Dialog {
+    /// Rysuje okno dialogowe. Window nadal pokazuje się przez Context.
+    fn show(&mut self, ctx: &egui::Context, act: &mut Actions) {
+        let mut window_open = true;
+
+        egui::Window::new("Nowe zadanie")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut window_open)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                self.draw_form(ui);
+
+                if let Some(err) = &self.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(ERROR_COLOR, err);
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                Self::draw_buttons(ui, act);
+
+                // Enter = start, Esc = anuluj.
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    act.submit = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    act.cancel = true;
+                }
+            });
+
+        // Zamknięcie krzyżykiem traktujemy jak anulowanie.
+        if !window_open {
+            act.cancel = true;
+        }
+    }
+
+    /// Trzy pola formularza w siatce dwukolumnowej.
+    fn draw_form(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("form")
+            .num_columns(2)
+            .spacing([10.0, 10.0])
+            .show(ui, |ui| {
+                ui.label("Nazwa zadania:");
+                let resp = ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(200.0));
+                if self.focus_name {
+                    resp.request_focus();
+                    self.focus_name = false;
+                }
+                ui.end_row();
+
+                ui.label("Tag:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tag)
+                        .hint_text("do grupowania, opcjonalny")
+                        .desired_width(200.0),
+                );
+                ui.end_row();
+
+                ui.label("Czas:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.time)
+                        .hint_text("np. 1h 20min")
+                        .desired_width(200.0),
+                );
+                ui.end_row();
+            });
+    }
+
+    fn draw_buttons(ui: &mut egui::Ui, act: &mut Actions) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_sized([80.0, 26.0], egui::Button::new("start"))
+                .clicked()
+            {
+                act.submit = true;
+            }
+            if ui.button("anuluj").clicked() {
+                act.cancel = true;
+            }
+        });
+    }
+}
+
+// ----------------------------------------------------------- widok pracy ---
+
 /// Dane trybu working przygotowane do wyświetlenia.
 struct WorkingView {
     name: String,
@@ -50,6 +158,40 @@ struct WorkingView {
     overtime: bool,
     paused: bool,
 }
+
+impl WorkingView {
+    fn from_task(t: &Task) -> Self {
+        let overtime = t.is_overtime();
+
+        // Czas sesji biegnie zawsze, także po wypełnieniu minimum
+        // i po przedłużeniu. Zaokrąglany w dół - "tyle już mam".
+        let session = fmt_minutes(t.worked().as_secs() / 60);
+
+        // Zostało tylko dopóki zobowiązanie niewypełnione.
+        // W górę, żeby 44:01 pokazać jeszcze jako 45min.
+        let remaining = (!overtime).then(|| fmt_minutes(t.remaining().as_secs().div_ceil(60)));
+
+        let (end_label, end) = if overtime {
+            ("Minimum od:", t.end_label.clone())
+        } else if t.is_paused() {
+            ("Koniec:", "wstrzymane".to_owned())
+        } else {
+            ("Koniec:", t.end_label.clone())
+        };
+
+        Self {
+            name: t.name.clone(),
+            end_label: end_label.to_owned(),
+            end,
+            session,
+            remaining,
+            overtime,
+            paused: t.is_paused(),
+        }
+    }
+}
+
+// -------------------------------------------------------------------- app ---
 
 pub struct App {
     config: AppConfig,
@@ -67,7 +209,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context, worklog: Box<dyn Worklog>, config : AppConfig) -> Self {
+    pub fn new(ctx: &egui::Context, worklog: Box<dyn Worklog>, config: AppConfig) -> Self {
         let working_anim = load_anim(ctx, "busy");
         // Brak osobnej animacji nadgodzin nie jest błędem - wtedy leci ta sama, co przy pracy.
         let overtime_anim = match load_anim(ctx, "overtime") {
@@ -91,6 +233,13 @@ impl App {
             worklog,
         }
     }
+
+    fn overtime_color(&self) -> egui::Color32 {
+        let (r, g, b) = self.config.overtime_color;
+        egui::Color32::from_rgb(r, g, b)
+    }
+
+    // --- przejścia między stanami ------------------------------------------
 
     fn start_task(&mut self, ctx: &egui::Context, name: String, tag: String, minutes: u64) {
         let minimum = Duration::from_secs(minutes * 60);
@@ -120,7 +269,7 @@ impl App {
         });
     }
 
-    /// Zadanie kończy wyłącznie użytkownik przyciskiem "przerwij".
+    /// Zadanie kończy wyłącznie użytkownik przyciskiem "zakończ".
     fn back_to_idle(&mut self, ctx: &egui::Context) {
         self.state = SessionState::Idle;
 
@@ -131,6 +280,219 @@ impl App {
             minimized: true,
             maximize: false,
         });
+    }
+
+    // --- rzeczy robione na starcie klatki ----------------------------------
+
+    /// Minimum wypełnione? Nie kończymy zadania - tylko raz sygnalizujemy.
+    fn notify_if_minimum_done(&mut self, ctx: &egui::Context) {
+        if let SessionState::Working(t) = &mut self.state {
+            if !t.notified && t.is_overtime() {
+                t.notified = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
+            }
+        }
+    }
+
+    /// Awaryjne przywracanie okna, jeśli mimo wyłączonego przycisku
+    /// zostało zminimalizowane skrótem systemowym.
+    fn keep_window_visible(&self, ctx: &egui::Context) {
+        if cfg!(feature = "kiosk") && matches!(self.state, SessionState::Working(_)) {
+            if ctx.input(|i| i.viewport().minimized) == Some(true) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            }
+        }
+    }
+
+    // --- rysowanie ---------------------------------------------------------
+
+    /// Animacja dobrana do stanu. Podczas pauzy własna - widać stan
+    /// jednym rzutem oka.
+    fn current_anim(&self) -> Anim {
+        match &self.state {
+            SessionState::Idle => self.idle_anim.clone(),
+            SessionState::Working(t) if t.is_paused() => self.pause_anim.clone(),
+            SessionState::Working(t) if t.is_overtime() => self.overtime_anim.clone(),
+            SessionState::Working(_) => self.working_anim.clone(),
+        }
+    }
+
+    /// Okno główne: animacja po lewej, treść zależna od stanu po prawej.
+    fn draw_main_panel(&self, ui: &mut egui::Ui, act: &mut Actions) {
+        let anim = self.current_anim();
+        let view = match &self.state {
+            SessionState::Working(t) => Some(WorkingView::from_task(t)),
+            SessionState::Idle => None,
+        };
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                self.draw_anim(ui, &anim);
+                ui.add_space(18.0);
+
+                ui.vertical(|ui| {
+                    ui.add_space(self.top_padding(view.as_ref()));
+                    match &view {
+                        None => self.draw_idle_pane(ui, act),
+                        Some(view) => self.draw_working_pane(ui, view, act),
+                    }
+                });
+            });
+        });
+    }
+
+    /// Kwadratowa animacja albo komunikat, czemu jej nie ma.
+    fn draw_anim(&self, ui: &mut egui::Ui, anim: &Anim) {
+        let size = self.config.anim_size;
+        match &anim.error {
+            None => {
+                ui.add(
+                    egui::Image::new(anim.uri.as_str())
+                        .fit_to_exact_size(egui::vec2(size, size))
+                        .maintain_aspect_ratio(false),
+                );
+            }
+            Some(err) => {
+                ui.allocate_ui(egui::vec2(size, size), |ui| {
+                    ui.colored_label(ERROR_COLOR, err);
+                });
+            }
+        }
+    }
+
+    /// Wyśrodkowanie prawej kolumny względem animacji - każdy stan ma inną
+    /// wysokość treści. Wartości dobrane ręcznie pod `text_size = 20`
+    /// i wymagają korekty przy zmianie czcionki.
+    fn top_padding(&self, view: Option<&WorkingView>) -> f32 {
+        let half = self.config.anim_size / 2.0;
+        match view {
+            None => half - 58.0,
+            // Busy ma cztery wiersze, overtime trzy.
+            Some(v) if v.remaining.is_some() => half - 84.0,
+            Some(_) => half - 66.0,
+        }
+    }
+
+    // --- prawa kolumna: idle -----------------------------------------------
+
+    fn draw_idle_pane(&self, ui: &mut egui::Ui, act: &mut Actions) {
+        if ui
+            .add_sized([160.0, 34.0], egui::Button::new("nowe zadanie"))
+            .clicked()
+        {
+            act.open_dialog = true;
+        }
+
+        ui.add_space(14.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("plik logu…").clicked() {
+                act.pick_log = true;
+            }
+            if self.log_path.is_some() && ui.button("wyłącz").clicked() {
+                act.clear_log = true;
+            }
+        });
+
+        self.draw_log_status(ui);
+    }
+
+    /// Dwie linijki drobnym drukiem: dokąd idzie zapis i ewentualny błąd.
+    fn draw_log_status(&self, ui: &mut egui::Ui) {
+        match &self.log_path {
+            Some(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                ui.label(
+                    egui::RichText::new(format!("zapis do: {name}"))
+                        .small()
+                        .color(self.overtime_color()),
+                )
+                .on_hover_text(path.display().to_string());
+            }
+            None => {
+                ui.label(egui::RichText::new("logowanie nieaktywne").small().weak());
+            }
+        }
+
+        if let Some(status) = &self.log_status {
+            ui.label(egui::RichText::new(status).small().color(ERROR_COLOR));
+        }
+    }
+
+    // --- prawa kolumna: praca ----------------------------------------------
+
+    fn draw_working_pane(&self, ui: &mut egui::Ui, view: &WorkingView, act: &mut Actions) {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        self.draw_working_rows(ui, view);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            self.draw_working_buttons(ui, view, act);
+        });
+    }
+
+    /// Trzy albo cztery wiersze "etykieta: wartość".
+    fn draw_working_rows(&self, ui: &mut egui::Ui, view: &WorkingView) {
+        self.row(ui, "Bieżące zadanie:", &view.name);
+        self.row(ui, &view.end_label, &view.end);
+
+        if view.overtime {
+            self.row_colored(ui, "Czas sesji:", &view.session, self.overtime_color());
+        } else {
+            self.row(ui, "Czas sesji:", &view.session);
+        }
+
+        if let Some(left) = &view.remaining {
+            self.row(ui, "Pozostało:", left);
+        }
+    }
+
+    fn draw_working_buttons(&self, ui: &mut egui::Ui, view: &WorkingView, act: &mut Actions) {
+        let h = self.config.button_height;
+
+        let label = if view.paused { "wznów" } else { "pauza" };
+        if ui.add_sized([90.0, h], egui::Button::new(label)).clicked() {
+            act.toggle_pause = true;
+        }
+        if ui
+            .add_sized([90.0, h], egui::Button::new("zakończ"))
+            .clicked()
+        {
+            act.abort = true;
+        }
+
+        // Przedłużenie ma sens dopiero, gdy zobowiązanie wypełnione.
+        if view.overtime {
+            self.draw_extend_combo(ui, act);
+        }
+    }
+
+    fn draw_extend_combo(&self, ui: &mut egui::Ui, act: &mut Actions) {
+        // ComboBox nie przyjmuje add_sized - wysokość bierze ze stylu.
+        // Zmiana dotyczy tylko tego wiersza.
+        let text_h = ui.text_style_height(&egui::TextStyle::Button);
+        ui.spacing_mut().interact_size.y = self.config.button_height;
+        ui.spacing_mut().button_padding.y = ((self.config.button_height - text_h) / 2.0).max(0.0);
+
+        egui::ComboBox::from_id_salt("extend")
+            .selected_text("przedłuż")
+            .width(110.0)
+            .show_ui(ui, |ui| {
+                for minutes in &self.config.extend_options {
+                    if ui
+                        .selectable_label(false, format!("+{minutes} min"))
+                        .clicked()
+                    {
+                        act.extend = Some(*minutes as u64);
+                    }
+                }
+            });
     }
 
     fn row(&self, ui: &mut egui::Ui, label: &str, value: &str) {
@@ -152,6 +514,162 @@ impl App {
             );
         });
     }
+
+    // --- reakcje na akcje użytkownika --------------------------------------
+
+    fn apply(&mut self, ctx: &egui::Context, act: Actions) {
+        self.apply_dialog(ctx, &act);
+        self.apply_task(ctx, &act);
+        self.apply_log(&act);
+    }
+
+    fn apply_dialog(&mut self, ctx: &egui::Context, act: &Actions) {
+        if act.open_dialog {
+            self.dialog = Some(Dialog::default());
+        }
+        if act.cancel {
+            self.dialog = None;
+        }
+        if act.submit {
+            self.submit_dialog(ctx);
+        }
+    }
+
+    /// Próba startu zadania z danych z dialogu. Zły czas = komunikat w dialogu,
+    /// okno zostaje otwarte.
+    fn submit_dialog(&mut self, ctx: &egui::Context) {
+        let parsed = self.dialog.as_ref().and_then(|d| {
+            parse_duration_minutes(&d.time).map(|m| (d.name.clone(), d.tag.clone(), m))
+        });
+
+        match parsed {
+            Some((name, tag, minutes)) => {
+                let name = if name.trim().is_empty() {
+                    "(bez nazwy)".to_owned()
+                } else {
+                    name.trim().to_owned()
+                };
+                self.start_task(ctx, name, tag.trim().to_owned(), minutes);
+                self.dialog = None;
+            }
+            None => {
+                if let Some(d) = self.dialog.as_mut() {
+                    d.error = Some(
+                        "Nie rozumiem czasu. Wpisz np. \"1h 20min\", \"45min\" albo \"1:30\"."
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn apply_task(&mut self, ctx: &egui::Context, act: &Actions) {
+        if act.toggle_pause {
+            if let SessionState::Working(t) = &mut self.state {
+                if t.is_paused() {
+                    t.resume();
+                } else {
+                    t.pause();
+                }
+            }
+        }
+
+        if let Some(minutes) = act.extend {
+            if let SessionState::Working(t) = &mut self.state {
+                t.extend(Duration::from_secs(minutes * 60));
+                log::info!("sesja przedłużona o {minutes} min");
+            }
+        }
+
+        if act.abort {
+            self.finish_task(ctx);
+        }
+    }
+
+    /// Zapis PRZED zmianą stanu - potem zadania już nie ma.
+    fn finish_task(&mut self, ctx: &egui::Context) {
+        if let SessionState::Working(t) = &self.state {
+            match self.worklog.add_record(t) {
+                Ok(()) => {
+                    log::info!("zapisano do logu");
+                    self.log_status = None;
+                }
+                Err(err) => {
+                    log::error!("zapis do logu nieudany: {err}");
+                    self.log_status = Some(format!("Błąd zapisu: {err}"));
+                }
+            }
+        }
+        self.back_to_idle(ctx);
+    }
+
+    fn apply_log(&mut self, act: &Actions) {
+        if act.pick_log {
+            self.pick_log_file();
+        }
+        if act.clear_log {
+            self.log_path = None;
+            self.log_status = None;
+        }
+    }
+
+    /// Dialog systemowy blokuje wątek UI aż do wyboru - to jest OK,
+    /// bo i tak nie ma co odświeżać w tle.
+    fn pick_log_file(&mut self) {
+        let mut chooser = rfd::FileDialog::new()
+            .set_title("Plik logu zadań")
+            .add_filter("CSV", &["csv"]);
+
+        chooser = match &self.log_path {
+            Some(current) => {
+                let dir = current.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                chooser.set_directory(dir).set_file_name(
+                    current
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            }
+            None => chooser.set_file_name("zadania.csv"),
+        };
+
+        if let Some(path) = chooser.save_file() {
+            log::info!("plik logu: {}", path.display());
+            self.log_path = Some(path);
+            self.log_status = None;
+        }
+    }
+
+    // --- odświeżanie -------------------------------------------------------
+
+    /// Obudź się dokładnie wtedy, gdy zmieni się wyświetlana minuta.
+    /// Podczas pauzy nic nie tyka, więc nie ma po co budzić UI.
+    fn schedule_repaint(&self, ctx: &egui::Context) {
+        if let SessionState::Working(t) = &self.state {
+            if !t.is_paused() {
+                ctx.request_repaint_after(Duration::from_secs(next_tick_secs(t)));
+            }
+        }
+    }
+}
+
+/// Ile sekund do najbliższej zmiany któregokolwiek z wyświetlanych liczników.
+/// W stanie busy tykają dwa naraz - bierzemy wcześniejszy z nich.
+fn next_tick_secs(t: &Task) -> u64 {
+    // Czas sesji rośnie i jest zaokrąglany w dół.
+    let session_wait = 60 - t.worked().as_secs() % 60;
+
+    let wait = if t.is_overtime() {
+        session_wait
+    } else {
+        // Pozostało maleje i jest zaokrąglane w górę.
+        let secs = t.remaining().as_secs();
+        let shown_min = secs.div_ceil(60);
+        let remaining_wait = secs - 60 * shown_min.saturating_sub(1);
+        session_wait.min(remaining_wait)
+    };
+
+    wait.clamp(1, 60)
 }
 
 impl eframe::App for App {
@@ -161,415 +679,16 @@ impl eframe::App for App {
         // Context jest tanim uchwytem (Arc) - klonujemy, żeby nie kolidować z borrowem `ui`.
         let ctx = ui.ctx().clone();
 
-        // 1. Minimum wypełnione? Nie kończymy zadania - tylko raz sygnalizujemy.
-        if let SessionState::Working(t) = &mut self.state {
-            if !t.notified && t.is_overtime() {
-                t.notified = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                    egui::UserAttentionType::Informational,
-                ));
-            }
+        self.notify_if_minimum_done(&ctx);
+        self.keep_window_visible(&ctx);
+
+        let mut act = Actions::default();
+        self.draw_main_panel(ui, &mut act);
+        if let Some(dialog) = self.dialog.as_mut() {
+            dialog.show(&ctx, &mut act);
         }
 
-        // Awaryjne przywracanie okna, jeśli mimo wyłączonego przycisku
-        // zostało zminimalizowane skrótem systemowym.
-        if cfg!(feature = "kiosk") && matches!(self.state, SessionState::Working(_)) {
-            if ctx.input(|i| i.viewport().minimized) == Some(true) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            }
-        }
-
-        // 2. Przygotuj dane do wyświetlenia (żeby nie walczyć z borrow checkerem w domknięciach).
-        // Podczas pauzy wracamy do animacji idle - widać stan jednym rzutem oka.
-        let anim = match &self.state {
-            SessionState::Idle => self.idle_anim.clone(),
-            SessionState::Working(t) if t.is_paused() => self.pause_anim.clone(),
-            SessionState::Working(t) if t.is_overtime() => self.overtime_anim.clone(),
-            SessionState::Working(_) => self.working_anim.clone(),
-        };
-        let working_view = match &self.state {
-            SessionState::Working(t) => {
-                let overtime = t.is_overtime();
-
-                // Czas sesji biegnie zawsze, także po wypełnieniu minimum
-                // i po przedłużeniu. Zaokrąglany w dół - "tyle już mam".
-                let session = fmt_minutes(t.worked().as_secs() / 60);
-
-                // Zostało tylko dopóki zobowiązanie niewypełnione.
-                // W górę, żeby 44:01 pokazać jeszcze jako 45min.
-                let remaining = (!overtime)
-                    .then(|| fmt_minutes(t.remaining().as_secs().div_ceil(60)));
-
-                let (end_label, end) = if overtime {
-                    ("Minimum od:", t.end_label.clone())
-                } else if t.is_paused() {
-                    ("Koniec:", "wstrzymane".to_owned())
-                } else {
-                    ("Koniec:", t.end_label.clone())
-                };
-
-                Some(WorkingView {
-                    name: t.name.clone(),
-                    end_label: end_label.to_owned(),
-                    end,
-                    session,
-                    remaining,
-                    overtime,
-                    paused: t.is_paused(),
-                })
-            }
-            SessionState::Idle => None,
-        };
-
-        let mut open_dialog = false;
-        let mut abort = false;
-        let mut toggle_pause = false;
-        let mut pick_log = false;
-        let mut clear_log = false;
-        let mut extend: Option<u64> = None;
-        let log_path = self.log_path.clone();
-        let log_status = self.log_status.clone();
-        let anim_size = self.config.anim_size;
-        let button_height = self.config.button_height;
-        let overtime_color = egui::Color32::from_rgb(
-                                self.config.overtime_color.0, 
-                                self.config.overtime_color.1, 
-                                self.config.overtime_color.2
-                            );
-
-        // 3. Okno główne.
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.add_space(6.0);
-
-                // Lewa strona: kwadratowa animacja albo komunikat, czemu jej nie ma.
-                match &anim.error {
-                    None => {
-                        ui.add(
-                            egui::Image::new(anim.uri.as_str())
-                                .fit_to_exact_size(egui::vec2(anim_size, anim_size))
-                                .maintain_aspect_ratio(false),
-                        );
-                    }
-                    Some(err) => {
-                        ui.allocate_ui(egui::vec2(anim_size, anim_size), |ui| {
-                            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
-                        });
-                    }
-                }
-
-                ui.add_space(18.0);
-
-                // Prawa strona: zależnie od stanu.
-                ui.vertical(|ui| {
-                    // Wyśrodkowanie względem animacji: każdy stan ma inną wysokość treści.
-                    ui.add_space(match &working_view {
-                        None => anim_size / 2.0 - 58.0,
-                        // Busy ma cztery wiersze, overtime trzy.
-                        Some(v) if v.remaining.is_some() => anim_size / 2.0 - 84.0,
-                        Some(_) => anim_size / 2.0 - 66.0,
-                    });
-                    match &working_view {
-                        None => {
-                            if ui
-                                .add_sized([160.0, 34.0], egui::Button::new("nowe zadanie"))
-                                .clicked()
-                            {
-                                open_dialog = true;
-                            }
-
-                            ui.add_space(14.0);
-
-                            ui.horizontal(|ui| {
-                                if ui.button("plik logu…").clicked() {
-                                    pick_log = true;
-                                }
-                                if log_path.is_some() && ui.button("wyłącz").clicked() {
-                                    clear_log = true;
-                                }
-                            });                            
-
-                            match &log_path {
-                                Some(path) => {
-                                    let name = path
-                                        .file_name()
-                                        .map(|n| n.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| path.display().to_string());
-                                    ui.label(
-                                        egui::RichText::new(format!("zapis do: {name}"))
-                                            .small()
-                                            .color(overtime_color),
-                                    )
-                                    .on_hover_text(path.display().to_string());
-                                }
-                                None => {
-                                    ui.label(
-                                        egui::RichText::new("logowanie nieaktywne")
-                                            .small()
-                                            .weak(),
-                                    );
-                                }
-                            }
-
-                            if let Some(status) = &log_status {
-                                ui.label(
-                                    egui::RichText::new(status)
-                                        .small()
-                                        .color(egui::Color32::from_rgb(220, 80, 80)),
-                                );
-                            }
-                        }
-                        Some(view) => {
-                            ui.spacing_mut().item_spacing.y = 8.0;
-                            self.row(ui, "Bieżące zadanie:", &view.name);
-                            self.row(ui, &view.end_label, &view.end);
-                            if view.overtime {
-                                self.row_colored(ui, "Czas sesji:", &view.session, overtime_color);
-                            } else {
-                                self.row(ui, "Czas sesji:", &view.session);
-                            }
-                            if let Some(left) = &view.remaining {
-                                self.row(ui, "Pozostało:", left);
-                            }
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                let label = if view.paused { "wznów" } else { "pauza" };
-                                if ui
-                                    .add_sized([90.0, button_height], egui::Button::new(label))
-                                    .clicked()
-                                {
-                                    toggle_pause = true;
-                                }
-                                if ui
-                                    .add_sized([90.0, button_height], egui::Button::new("zakończ"))
-                                    .clicked() 
-                                {
-                                    abort = true;
-                                }
-                                // Przedłużenie ma sens dopiero, gdy zobowiązanie wypełnione.
-                                if view.overtime {
-                                    // ComboBox nie przyjmuje add_sized - wysokość bierze
-                                    // ze stylu. Zmiana dotyczy tylko tego wiersza.
-                                    let text_h = ui.text_style_height(&egui::TextStyle::Button);
-                                    ui.spacing_mut().interact_size.y = button_height;
-                                    ui.spacing_mut().button_padding.y =
-                                        ((button_height - text_h) / 2.0).max(0.0);
-
-                                    egui::ComboBox::from_id_salt("extend")
-                                        .selected_text("przedłuż")
-                                        .width(110.0)
-                                        .show_ui(ui, |ui| {
-                                            for minutes in &self.config.extend_options {
-                                                if ui
-                                                    .selectable_label(
-                                                        false,
-                                                        format!("+{minutes} min"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    extend = Some(*minutes as u64);
-                                                }
-                                            }
-                                        });
-                                }
-                            });
-                        }
-                    }
-                });
-            });
-        });
-
-        // 4. Dialog "nowe zadanie" - Window nadal pokazuje się przez Context.
-        let mut submit = false;
-        let mut cancel = false;
-
-        if let Some(d) = self.dialog.as_mut() {
-            let mut window_open = true;
-            egui::Window::new("Nowe zadanie")
-                .collapsible(false)
-                .resizable(false)
-                .open(&mut window_open)
-                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-                .show(&ctx, |ui| {
-                    egui::Grid::new("form")
-                        .num_columns(2)
-                        .spacing([10.0, 10.0])
-                        .show(ui, |ui| {
-                            ui.label("Nazwa zadania:");
-                            let resp =
-                                ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(200.0));
-                            if d.focus_name {
-                                resp.request_focus();
-                                d.focus_name = false;
-                            }
-                            ui.end_row();
-
-                            ui.label("Tag:");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut d.tag)
-                                    .hint_text("do grupowania, opcjonalny")
-                                    .desired_width(200.0),
-                            );
-                            ui.end_row();
-
-                            ui.label("Czas:");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut d.time)
-                                    .hint_text("np. 1h 20min")
-                                    .desired_width(200.0),
-                            );
-                            ui.end_row();
-                        });
-
-                    if let Some(err) = &d.error {
-                        ui.add_space(4.0);
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
-                    }
-
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_sized([80.0, 26.0], egui::Button::new("start"))
-                            .clicked()
-                        {
-                            submit = true;
-                        }
-                        if ui.button("anuluj").clicked() {
-                            cancel = true;
-                        }
-                    });
-
-                    // Enter = start, Esc = anuluj.
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        submit = true;
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        cancel = true;
-                    }
-                });
-
-            if !window_open {
-                cancel = true;
-            }
-        }
-
-        // 5. Reakcje na akcje użytkownika.
-        if open_dialog {
-            self.dialog = Some(Dialog::default());
-        }
-        if cancel {
-            self.dialog = None;
-        }
-        if submit {
-            let parsed = self.dialog.as_ref().and_then(|d| {
-                parse_duration_minutes(&d.time).map(|m| (d.name.clone(), d.tag.clone(), m))
-            });
-
-            match parsed {
-                Some((name, tag, minutes)) => {
-                    let name = if name.trim().is_empty() {
-                        "(bez nazwy)".to_owned()
-                    } else {
-                        name.trim().to_owned()
-                    };
-                    self.start_task(&ctx, name, tag.trim().to_owned(), minutes);
-                    self.dialog = None;
-                }
-                None => {
-                    if let Some(d) = self.dialog.as_mut() {
-                        d.error = Some(
-                            "Nie rozumiem czasu. Wpisz np. \"1h 20min\", \"45min\" albo \"1:30\"."
-                                .to_owned(),
-                        );
-                    }
-                }
-            }
-        }
-        if toggle_pause {
-            if let SessionState::Working(t) = &mut self.state {
-                if t.is_paused() {
-                    t.resume();
-                } else {
-                    t.pause();
-                }
-            }
-        }
-        if let Some(minutes) = extend {
-            if let SessionState::Working(t) = &mut self.state {
-                t.extend(Duration::from_secs(minutes * 60));
-                log::info!("sesja przedłużona o {minutes} min");
-            }
-        }
-
-        if abort {
-            // Zapis PRZED zmianą stanu - potem zadania już nie ma.
-            if let SessionState::Working(t) = &self.state {
-                match self.worklog.add_record(t) {
-                    Ok(()) => {
-                        log::info!("zapisano do logu");
-                        self.log_status = None;
-                    }
-                    Err(err) => {
-                        log::error!("zapis do logu nieudany: {err}");
-                        self.log_status = Some(format!("Błąd zapisu: {err}"));
-                    }
-                }
-            }
-            self.back_to_idle(&ctx);
-        }
-
-        if pick_log {
-            // Dialog systemowy blokuje wątek UI aż do wyboru - to jest OK,
-            // bo i tak nie ma co odświeżać w tle.
-            let mut chooser = rfd::FileDialog::new()
-                .set_title("Plik logu zadań")
-                .add_filter("CSV", &["csv"]);
-            chooser = match &self.log_path {
-                Some(current) => {
-                    let dir = current.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-                    chooser.set_directory(dir).set_file_name(
-                        current
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
-                    )
-                }
-                None => chooser.set_file_name("zadania.csv"),
-            };
-            if let Some(path) = chooser.save_file() {
-                log::info!("plik logu: {}", path.display());
-                self.log_path = Some(path);
-                self.log_status = None;
-            }
-        }
-
-        if clear_log {
-            self.log_path = None;
-            self.log_status = None;
-        }
-
-        // 6. Odświeżanie: obudź się dokładnie wtedy, gdy zmieni się wyświetlana minuta.
-        // W stanie busy tykają dwa liczniki - bierzemy wcześniejszy z nich.
-        // Podczas pauzy nic nie tyka, więc nie ma po co budzić UI.
-        if let SessionState::Working(t) = &self.state {
-            if !t.is_paused() {
-                // Czas sesji rośnie i jest zaokrąglany w dół.
-                let session_wait = 60 - t.worked().as_secs() % 60;
-
-                let wait = if t.is_overtime() {
-                    session_wait
-                } else {
-                    // Pozostało maleje i jest zaokrąglane w górę.
-                    let secs = t.remaining().as_secs();
-                    let shown_min = secs.div_ceil(60);
-                    let remaining_wait = secs - 60 * shown_min.saturating_sub(1);
-                    session_wait.min(remaining_wait)
-                };
-
-                ctx.request_repaint_after(Duration::from_secs(wait.clamp(1, 60)));
-            }
-        }
+        self.apply(&ctx, act);
+        self.schedule_repaint(&ctx);
     }
 }
