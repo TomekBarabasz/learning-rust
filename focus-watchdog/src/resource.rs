@@ -12,16 +12,7 @@ pub struct Anim {
 }
 
 /// Animacje wkompilowane w binarkę na etapie `cargo build`.
-///
-/// Ścieżki są względne do tego pliku (`src/main.rs`), więc pliki muszą istnieć
-/// pod `assets/` już w czasie kompilacji - inaczej dostaniesz błąd kompilatora.
-/// Zmieniasz format? Popraw i rozszerzenie w pierwszej kolumnie, i ścieżkę.
-const EMBEDDED: &[(&str, &str, &[u8])] = &[
-    ("idle", "gif", include_bytes!("../assets/idle.gif")),
-    ("busy", "gif", include_bytes!("../assets/busy.gif")),
-    ("pause", "gif", include_bytes!("../assets/pause.gif")),
-    ("overtime", "gif", include_bytes!("../assets/overtime.gif")),
-];
+include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 
 /// Ikona okna (pasek zadań, Alt+Tab). Kwadratowy PNG, najlepiej 256x256.
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
@@ -82,9 +73,9 @@ pub fn load_anim(ctx: &egui::Context, stem: &str) -> Anim {
     }
 
     // Nic na dysku - użyj wersji wkompilowanej w binarkę.
-    for (name, ext, bytes) in EMBEDDED {
+    for (name, bytes) in EMBEDDED {
         if *name == stem {
-            let uri = format!("bytes://{stem}.{ext}");
+            let uri = format!("bytes://{stem}");
             log::info!("Używam wbudowanej animacji {uri} ({} bajtów)", bytes.len());
             ctx.include_bytes(uri.clone(), *bytes);
             return Anim { uri, error: None };
