@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use crate::task::Task;
 use crate::resource::{Anim, load_anim};
-use crate::utils::{fmt_minutes, parse_duration_minutes, to_minutes};
-use crate::worklog::{append_log};
+use crate::utils::{fmt_minutes, parse_duration_minutes};
+use crate::worklog::Worklog;
 use crate::config::AppConfig;
 
 pub enum SessionState {
@@ -63,10 +63,11 @@ pub struct App {
     log_path: Option<PathBuf>,
     /// Komunikat po ostatniej próbie zapisu.
     log_status: Option<String>,
+    worklog: Box<dyn Worklog>,
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context, config : AppConfig) -> Self {
+    pub fn new(ctx: &egui::Context, worklog: Box<dyn Worklog>, config : AppConfig) -> Self {
         let working_anim = load_anim(ctx, "busy");
         // Brak osobnej animacji nadgodzin nie jest błędem - wtedy leci ta sama, co przy pracy.
         let overtime_anim = match load_anim(ctx, "overtime") {
@@ -87,6 +88,7 @@ impl App {
             pause_anim: load_anim(ctx, "pause"),
             log_path: None,
             log_status: None,
+            worklog,
         }
     }
 
@@ -504,16 +506,14 @@ impl eframe::App for App {
         if abort {
             // Zapis PRZED zmianą stanu - potem zadania już nie ma.
             if let SessionState::Working(t) = &self.state {
-                if let Some(path) = self.log_path.clone() {
-                    match append_log(&path, t) {
-                        Ok(()) => {
-                            log::info!("zapisano do logu: {}", path.display());
-                            self.log_status = None;
-                        }
-                        Err(err) => {
-                            log::error!("zapis do logu nieudany: {err}");
-                            self.log_status = Some(format!("Błąd zapisu: {err}"));
-                        }
+                match self.worklog.add_record(t) {
+                    Ok(()) => {
+                        log::info!("zapisano do logu");
+                        self.log_status = None;
+                    }
+                    Err(err) => {
+                        log::error!("zapis do logu nieudany: {err}");
+                        self.log_status = Some(format!("Błąd zapisu: {err}"));
                     }
                 }
             }

@@ -10,12 +10,10 @@ mod task;
 
 use eframe::egui;
 use std::env;
-use resource::{Anim, load_anim, load_icon};
 use app::App;
-use config::AppConfig;
-use task::Task;
     
-static APP_NAME: &str = "Nope, Finish This First!";
+static APP_NAME: &str = "Focus Watchdog";
+static APP_TITLE: &str = "Nope, Finish This First!";
 
 fn main() -> eframe::Result {
     let config = config::load_config( env::args().nth(1).as_deref());
@@ -33,9 +31,9 @@ fn main() -> eframe::Result {
         .with_inner_size(window_size)
         .with_resizable(false)
         .with_maximize_button(false)
-        .with_title(APP_NAME);
+        .with_title(APP_TITLE);
 
-    if let Some(icon) = load_icon() {
+    if let Some(icon) = resource::load_icon() {
         viewport = viewport.with_icon(icon);
     }
 
@@ -44,13 +42,21 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
+    let mut worklog = match worklog::make_worklog(config.clone()) {
+        Ok(w) => w,
+        Err(err) => {
+            log::error!("Nie udało się utworzyć workloga: {err}");
+            std::process::exit(1);
+        }
+    };
+
     eframe::run_native(
-        "Focus Watchdog",
+        APP_NAME,
         options,
         Box::new(|cc| {
             // Bez tego obrazki się nie załadują.
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(App::new(&cc.egui_ctx, config.unwrap_or_default())))
+            Ok(Box::new(App::new(&cc.egui_ctx, worklog, config.unwrap_or_default())))
         }),
     )
 }

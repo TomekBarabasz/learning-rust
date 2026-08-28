@@ -5,7 +5,7 @@ use std::env;
 use anyhow::Result;
 
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppConfig {
     pub url: Option<String>,
     pub token: Option<String>,
