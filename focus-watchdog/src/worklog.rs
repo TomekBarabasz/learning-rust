@@ -1,8 +1,9 @@
-use anyhow::{anyhow,Result};
+use anyhow::{bail,Result,Context};
 use std::{fs::File, fs::OpenOptions, io::Write, path::PathBuf};
 //use std::time::{Duration, Instant};
 use chrono::Local;
 use std::time::Duration;
+use serde_json::Value;
 
 use crate::config::AppConfig;
 use crate::task::Task;
@@ -110,7 +111,7 @@ struct RemoteWorklog {
 impl RemoteWorklog {
     pub fn new(url: String, token: String) -> Self {
         Self { url, token, client: reqwest::blocking::Client::builder()
-                                    .timeout(Duration::from_secs(10))
+                                    .timeout(Duration::from_secs(15))
                                     .build()
                                     .expect("Failed to build HTTP client") 
         }
@@ -120,8 +121,8 @@ impl RemoteWorklog {
 impl Worklog for RemoteWorklog {
     fn add_record(&mut self, task: &Task) -> Result<()> {
         // TODO: sprawdzić w sb-client jak to zformatować poprawnie żeby Lua się nie pluło
-        let line = format!(
-            "|{}|{}|{}|{}|{}|{}|{}|\n",
+        let record = format!(
+            "{},{},{},{},{},{},{}",
             task.started_at.format(DATE_FMT),
             Local::now().format(DATE_FMT),
             csv_field(&task.name),
@@ -130,13 +131,46 @@ impl Worklog for RemoteWorklog {
             to_minutes(task.worked()),
             to_minutes(task.paused_time()),
         );
-        let expr = format!("worklog.addCsv({})", serde_json::Value::String(line));
-        let body = reqwest::blocking::Client::new()
-            .post(format!("{}/.runtime/lua",self.url))
+        let expr = format!("worklog.addCsv({})", serde_json::Value::String(record));
+        log::info!("sending expression {:?}",expr);
+        let endpoint = format!("{}/.runtime/lua",self.url.trim_end_matches('/'));
+        let req = self.client
+            .post(&endpoint)
+            .header("Content-Type", "text/plain")
             .bearer_auth(&self.token)
-            .body(expr)
-            .send()?
-            .text()?;
+            .body(expr);
+        let resp = req
+            .send()
+            .with_context(|| format!("nie udało się połączyć z {endpoint}"))?;
+
+        let status = resp.status();
+        let text = resp.text().context("nie udało się odczytać odpowiedzi")?;
+
+        let body: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => {
+                // np. strona logowania w HTML zamiast JSON-a
+                let preview: String = text.chars().take(200).collect();
+                let error_msg = format!("serwer zwrócił {status}, a treść nie jest JSON-em:\n{preview}");
+                log::error!("{}",error_msg);
+                bail!(error_msg);
+            }
+        };
+
+        if !status.is_success() {
+            let msg = body["error"].as_str().unwrap_or("nieznany błąd");
+            let code = body["code"].as_str().unwrap_or("-");
+            let hint = match status.as_u16() {
+                401 | 403 => "  (sprawdź --token / SB_AUTH_TOKEN na serwerze)",
+                503 => "  (Runtime API wyłączone albo headless Chrome jeszcze nie wstał)",
+                504 => "  (podbij --timeout)",
+                500 => "  (błąd w samym kodzie Lua)",
+                _ => "",
+            };
+            let error_msg = format!("{status} [{code}]: {msg}{hint}");
+            log::error!("{}",error_msg);
+            bail!(error_msg);
+        }
         Ok(())
     }
 
@@ -160,7 +194,7 @@ impl DummyWorklog {
     }
 }
 impl Worklog for DummyWorklog {
-    fn add_record(&mut self, task: &Task) -> Result<()> {
+    fn add_record(&mut self, _task: &Task) -> Result<()> {
         Ok(())
     }
 

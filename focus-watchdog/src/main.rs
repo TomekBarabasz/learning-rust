@@ -9,7 +9,6 @@ mod resource;
 mod app;
 mod task;
 
-use std::path::PathBuf;
 use eframe::egui;
 use std::env;
 use app::App;
@@ -37,7 +36,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    let mut worklog = match worklog::make_worklog(config.clone()) {
+    let worklog = match worklog::make_worklog(config.clone()) {
         Ok(w) => w,
         Err(err) => {
             log::error!("Nie udało się utworzyć workloga: {err}");

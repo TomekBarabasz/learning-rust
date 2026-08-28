@@ -229,9 +229,9 @@ impl eframe::App for App {
         let mut extend: Option<u64> = None;
         let log_path = self.log_path.clone();
         let log_status = self.log_status.clone();
-        let ANIM_SIZE = self.config.anim_size;
-        let BUTTON_H = self.config.button_height;
-        let OVERTIME_COLOR = egui::Color32::from_rgb(
+        let anim_size = self.config.anim_size;
+        let button_height = self.config.button_height;
+        let overtime_color = egui::Color32::from_rgb(
                                 self.config.overtime_color.0, 
                                 self.config.overtime_color.1, 
                                 self.config.overtime_color.2
@@ -248,12 +248,12 @@ impl eframe::App for App {
                     None => {
                         ui.add(
                             egui::Image::new(anim.uri.as_str())
-                                .fit_to_exact_size(egui::vec2(ANIM_SIZE, ANIM_SIZE))
+                                .fit_to_exact_size(egui::vec2(anim_size, anim_size))
                                 .maintain_aspect_ratio(false),
                         );
                     }
                     Some(err) => {
-                        ui.allocate_ui(egui::vec2(ANIM_SIZE, ANIM_SIZE), |ui| {
+                        ui.allocate_ui(egui::vec2(anim_size, anim_size), |ui| {
                             ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
                         });
                     }
@@ -265,10 +265,10 @@ impl eframe::App for App {
                 ui.vertical(|ui| {
                     // Wyśrodkowanie względem animacji: każdy stan ma inną wysokość treści.
                     ui.add_space(match &working_view {
-                        None => ANIM_SIZE / 2.0 - 58.0,
+                        None => anim_size / 2.0 - 58.0,
                         // Busy ma cztery wiersze, overtime trzy.
-                        Some(v) if v.remaining.is_some() => ANIM_SIZE / 2.0 - 84.0,
-                        Some(_) => ANIM_SIZE / 2.0 - 66.0,
+                        Some(v) if v.remaining.is_some() => anim_size / 2.0 - 84.0,
+                        Some(_) => anim_size / 2.0 - 66.0,
                     });
                     match &working_view {
                         None => {
@@ -299,7 +299,7 @@ impl eframe::App for App {
                                     ui.label(
                                         egui::RichText::new(format!("zapis do: {name}"))
                                             .small()
-                                            .color(OVERTIME_COLOR),
+                                            .color(overtime_color),
                                     )
                                     .on_hover_text(path.display().to_string());
                                 }
@@ -325,7 +325,7 @@ impl eframe::App for App {
                             self.row(ui, "Bieżące zadanie:", &view.name);
                             self.row(ui, &view.end_label, &view.end);
                             if view.overtime {
-                                self.row_colored(ui, "Czas sesji:", &view.session, OVERTIME_COLOR);
+                                self.row_colored(ui, "Czas sesji:", &view.session, overtime_color);
                             } else {
                                 self.row(ui, "Czas sesji:", &view.session);
                             }
@@ -336,13 +336,13 @@ impl eframe::App for App {
                             ui.horizontal(|ui| {
                                 let label = if view.paused { "wznów" } else { "pauza" };
                                 if ui
-                                    .add_sized([90.0, BUTTON_H], egui::Button::new(label))
+                                    .add_sized([90.0, button_height], egui::Button::new(label))
                                     .clicked()
                                 {
                                     toggle_pause = true;
                                 }
                                 if ui
-                                    .add_sized([90.0, BUTTON_H], egui::Button::new("zakończ"))
+                                    .add_sized([90.0, button_height], egui::Button::new("zakończ"))
                                     .clicked() 
                                 {
                                     abort = true;
@@ -352,9 +352,9 @@ impl eframe::App for App {
                                     // ComboBox nie przyjmuje add_sized - wysokość bierze
                                     // ze stylu. Zmiana dotyczy tylko tego wiersza.
                                     let text_h = ui.text_style_height(&egui::TextStyle::Button);
-                                    ui.spacing_mut().interact_size.y = BUTTON_H;
+                                    ui.spacing_mut().interact_size.y = button_height;
                                     ui.spacing_mut().button_padding.y =
-                                        ((BUTTON_H - text_h) / 2.0).max(0.0);
+                                        ((button_height - text_h) / 2.0).max(0.0);
 
                                     egui::ComboBox::from_id_salt("extend")
                                         .selected_text("przedłuż")
