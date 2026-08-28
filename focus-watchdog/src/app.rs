@@ -30,11 +30,7 @@ struct Actions {
     toggle_pause: bool,
     extend: Option<u64>,
     abort: bool,
-    pick_log: bool,
-    clear_log: bool,
 }
-
-// ---------------------------------------------------------------- dialog ---
 
 /// Stan okienka dialogowego "nowe zadanie".
 struct Dialog {
@@ -142,8 +138,6 @@ impl Dialog {
     }
 }
 
-// ----------------------------------------------------------- widok pracy ---
-
 /// Dane trybu working przygotowane do wyświetlenia.
 struct WorkingView {
     name: String,
@@ -191,8 +185,6 @@ impl WorkingView {
     }
 }
 
-// -------------------------------------------------------------------- app ---
-
 pub struct App {
     config: AppConfig,
     state: SessionState,
@@ -201,8 +193,6 @@ pub struct App {
     working_anim: Anim,
     overtime_anim: Anim,
     pause_anim: Anim,
-    /// Plik CSV z logiem. None = logowanie nieaktywne.
-    log_path: Option<PathBuf>,
     /// Komunikat po ostatniej próbie zapisu.
     log_status: Option<String>,
     worklog: Box<dyn Worklog>,
@@ -228,7 +218,6 @@ impl App {
             working_anim,
             overtime_anim,
             pause_anim: load_anim(ctx, "pause"),
-            log_path: None,
             log_status: None,
             worklog,
         }
@@ -388,42 +377,7 @@ impl App {
         }
 
         ui.add_space(14.0);
-
-        ui.horizontal(|ui| {
-            if ui.button("plik logu…").clicked() {
-                act.pick_log = true;
-            }
-            if self.log_path.is_some() && ui.button("wyłącz").clicked() {
-                act.clear_log = true;
-            }
-        });
-
-        self.draw_log_status(ui);
-    }
-
-    /// Dwie linijki drobnym drukiem: dokąd idzie zapis i ewentualny błąd.
-    fn draw_log_status(&self, ui: &mut egui::Ui) {
-        match &self.log_path {
-            Some(path) => {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-                ui.label(
-                    egui::RichText::new(format!("zapis do: {name}"))
-                        .small()
-                        .color(self.overtime_color()),
-                )
-                .on_hover_text(path.display().to_string());
-            }
-            None => {
-                ui.label(egui::RichText::new("logowanie nieaktywne").small().weak());
-            }
-        }
-
-        if let Some(status) = &self.log_status {
-            ui.label(egui::RichText::new(status).small().color(ERROR_COLOR));
-        }
+        ui.label(egui::RichText::new(self.worklog.get_name()).small().weak());
     }
 
     // --- prawa kolumna: praca ----------------------------------------------
@@ -520,7 +474,6 @@ impl App {
     fn apply(&mut self, ctx: &egui::Context, act: Actions) {
         self.apply_dialog(ctx, &act);
         self.apply_task(ctx, &act);
-        self.apply_log(&act);
     }
 
     fn apply_dialog(&mut self, ctx: &egui::Context, act: &Actions) {
@@ -601,43 +554,6 @@ impl App {
             }
         }
         self.back_to_idle(ctx);
-    }
-
-    fn apply_log(&mut self, act: &Actions) {
-        if act.pick_log {
-            self.pick_log_file();
-        }
-        if act.clear_log {
-            self.log_path = None;
-            self.log_status = None;
-        }
-    }
-
-    /// Dialog systemowy blokuje wątek UI aż do wyboru - to jest OK,
-    /// bo i tak nie ma co odświeżać w tle.
-    fn pick_log_file(&mut self) {
-        let mut chooser = rfd::FileDialog::new()
-            .set_title("Plik logu zadań")
-            .add_filter("CSV", &["csv"]);
-
-        chooser = match &self.log_path {
-            Some(current) => {
-                let dir = current.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-                chooser.set_directory(dir).set_file_name(
-                    current
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                )
-            }
-            None => chooser.set_file_name("zadania.csv"),
-        };
-
-        if let Some(path) = chooser.save_file() {
-            log::info!("plik logu: {}", path.display());
-            self.log_path = Some(path);
-            self.log_status = None;
-        }
     }
 
     // --- odświeżanie -------------------------------------------------------
