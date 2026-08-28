@@ -1,12 +1,11 @@
 use eframe::egui;
 use std::time::{Duration, Instant};
 use chrono::Local;
-use std::path::PathBuf;
 
 use crate::task::Task;
 use crate::resource::{Anim, load_anim};
 use crate::utils::{fmt_minutes, parse_duration_minutes};
-use crate::worklog::Worklog;
+use crate::worklog::{Worklog,WorklogTask};
 use crate::config::AppConfig;
 
 /// Kolor komunikatów o błędach (brak animacji, zły format czasu, zapis do logu).
@@ -32,14 +31,16 @@ struct Actions {
     abort: bool,
 }
 
-/// Stan okienka dialogowego "nowe zadanie".
+const NAME_FIELD_WIDTH: f32 = 380.0;
+const SUGGEST_WIDTH: f32 = 110.0;
+
 struct Dialog {
     name: String,
     tag: String,
     time: String,
     error: Option<String>,
-    /// Czy w tej klatce ustawić fokus na pierwszym polu.
     focus_name: bool,
+    suggestions: Vec<WorklogTask>,
 }
 
 impl Default for Dialog {
@@ -50,11 +51,19 @@ impl Default for Dialog {
             time: String::new(),
             error: None,
             focus_name: true,
+            suggestions: Vec::new()
         }
     }
 }
 
 impl Dialog {
+    fn new(suggestions: Vec<WorklogTask>) -> Self {
+        Self {
+            suggestions,
+            ..Default::default()
+        }
+    }
+
     /// Rysuje okno dialogowe. Window nadal pokazuje się przez Context.
     fn show(&mut self, ctx: &egui::Context, act: &mut Actions) {
         let mut window_open = true;
@@ -62,6 +71,7 @@ impl Dialog {
         egui::Window::new("Nowe zadanie")
             .collapsible(false)
             .resizable(false)
+            .min_width(500.0)
             .open(&mut window_open)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
@@ -91,6 +101,45 @@ impl Dialog {
         }
     }
 
+    /// Wybór z listy wypełnia nazwę i tag. Oba zostają zwykłymi polami,
+    /// więc użytkownik może je potem poprawić.
+    fn draw_suggestions(&mut self, ui: &mut egui::Ui) {
+        if self.suggestions.is_empty() {
+            return;
+        }
+        
+        fn suggestion_label(task: &WorklogTask) -> String {
+            if task.tag.is_empty() {
+                task.name.clone()
+            } else {
+                format!("{} · {}", task.name, task.tag)
+            }
+        }
+
+
+        let mut chosen: Option<usize> = None;
+
+        egui::ComboBox::from_id_salt("task-suggestions")
+            .selected_text("poprzednie")
+            .width(SUGGEST_WIDTH)
+            .show_ui(ui, |ui| {
+                for (index, task) in self.suggestions.iter().enumerate() {
+                    if ui.selectable_label(false, suggestion_label(task)).clicked() {
+                        chosen = Some(index);
+                    }
+                }
+            });
+
+        if let Some(index) = chosen {
+            let (name, tag) = {
+                let task = &self.suggestions[index];
+                (task.name.clone(), task.tag.clone())
+            };
+            self.name = name;
+            self.tag = tag;
+        }
+    }
+
     /// Trzy pola formularza w siatce dwukolumnowej.
     fn draw_form(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("form")
@@ -98,11 +147,17 @@ impl Dialog {
             .spacing([10.0, 10.0])
             .show(ui, |ui| {
                 ui.label("Nazwa zadania:");
-                let resp = ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(200.0));
-                if self.focus_name {
-                    resp.request_focus();
-                    self.focus_name = false;
-                }
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.name)
+                            .desired_width(NAME_FIELD_WIDTH - SUGGEST_WIDTH - 8.0),
+                    );
+                    if self.focus_name {
+                        resp.request_focus();
+                        self.focus_name = false;
+                    }
+                    self.draw_suggestions(ui);
+                });
                 ui.end_row();
 
                 ui.label("Tag:");
@@ -193,32 +248,19 @@ pub struct App {
     working_anim: Anim,
     overtime_anim: Anim,
     pause_anim: Anim,
-    /// Komunikat po ostatniej próbie zapisu.
-    log_status: Option<String>,
     worklog: Box<dyn Worklog>,
 }
 
 impl App {
     pub fn new(ctx: &egui::Context, worklog: Box<dyn Worklog>, config: AppConfig) -> Self {
-        let working_anim = load_anim(ctx, "busy");
-        // Brak osobnej animacji nadgodzin nie jest błędem - wtedy leci ta sama, co przy pracy.
-        let overtime_anim = match load_anim(ctx, "overtime") {
-            anim if anim.error.is_none() => anim,
-            _ => {
-                log::info!("Brak animacji overtime - używam working");
-                working_anim.clone()
-            }
-        };
-
         Self {
             config,
             state: SessionState::Idle,
             dialog: None,
             idle_anim: load_anim(ctx, "idle"),
-            working_anim,
-            overtime_anim,
+            working_anim: load_anim(ctx, "busy"),
+            overtime_anim: load_anim(ctx, "overtime"),
             pause_anim: load_anim(ctx, "pause"),
-            log_status: None,
             worklog,
         }
     }
@@ -324,7 +366,6 @@ impl App {
                 ui.add_space(18.0);
 
                 ui.vertical(|ui| {
-                    ui.add_space(self.top_padding(view.as_ref()));
                     match &view {
                         None => self.draw_idle_pane(ui, act),
                         Some(view) => self.draw_working_pane(ui, view, act),
@@ -353,21 +394,6 @@ impl App {
         }
     }
 
-    /// Wyśrodkowanie prawej kolumny względem animacji - każdy stan ma inną
-    /// wysokość treści. Wartości dobrane ręcznie pod `text_size = 20`
-    /// i wymagają korekty przy zmianie czcionki.
-    fn top_padding(&self, view: Option<&WorkingView>) -> f32 {
-        let half = self.config.anim_size / 2.0;
-        match view {
-            None => half - 58.0,
-            // Busy ma cztery wiersze, overtime trzy.
-            Some(v) if v.remaining.is_some() => half - 84.0,
-            Some(_) => half - 66.0,
-        }
-    }
-
-    // --- prawa kolumna: idle -----------------------------------------------
-
     fn draw_idle_pane(&self, ui: &mut egui::Ui, act: &mut Actions) {
         if ui
             .add_sized([160.0, 34.0], egui::Button::new("nowe zadanie"))
@@ -390,10 +416,46 @@ impl App {
             self.draw_working_buttons(ui, view, act);
         });
     }
+    
+    
+    fn draw_name(&self, ui: &mut egui::Ui, name: &str) {
+        let font = egui::FontId::proportional(self.config.text_size);
+        let strong = ui.visuals().strong_text_color();
+        let normal = ui.visuals().text_color();
+        const NAME_WIDTH: f32 = 320.0;
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap = egui::text::TextWrapping {
+            max_width: NAME_WIDTH,
+            max_rows: 3,
+            // Długie słowo bez spacji ma się złamać, a nie wyjechać poza okno.
+            break_anywhere: true,
+            ..Default::default()
+        };
 
-    /// Trzy albo cztery wiersze "etykieta: wartość".
+        job.append(
+            "Bieżące zadanie:  ",
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: strong,
+                ..Default::default()
+            },
+        );
+        job.append(
+            name,
+            0.0,
+            egui::TextFormat {
+                font_id: font,
+                color: normal,
+                ..Default::default()
+            },
+        );
+
+        ui.add(egui::Label::new(job));
+    }
+
     fn draw_working_rows(&self, ui: &mut egui::Ui, view: &WorkingView) {
-        self.row(ui, "Bieżące zadanie:", &view.name);
+        self.draw_name(ui, &view.name);
         self.row(ui, &view.end_label, &view.end);
 
         if view.overtime {
@@ -478,7 +540,7 @@ impl App {
 
     fn apply_dialog(&mut self, ctx: &egui::Context, act: &Actions) {
         if act.open_dialog {
-            self.dialog = Some(Dialog::default());
+            self.dialog = Some(Dialog::new(self.worklog.get_recent_tasks()));
         }
         if act.cancel {
             self.dialog = None;
@@ -545,11 +607,9 @@ impl App {
             match self.worklog.add_record(t) {
                 Ok(()) => {
                     log::info!("zapisano do logu");
-                    self.log_status = None;
                 }
                 Err(err) => {
                     log::error!("zapis do logu nieudany: {err}");
-                    self.log_status = Some(format!("Błąd zapisu: {err}"));
                 }
             }
         }

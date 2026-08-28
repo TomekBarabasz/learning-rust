@@ -17,8 +17,7 @@ pub struct WorklogTask {
 pub trait Worklog {
     fn get_name(&self) -> String;
     fn add_record(&mut self, task: &Task) -> Result<()>;
-    fn get_task_names(&self) -> Result<Vec<WorklogTask>>;
-    fn get_top_tasks(&self) -> Result<Vec<WorklogTask>>;
+    fn get_recent_tasks(&self) -> Vec<WorklogTask>;
 }
 
 struct FileWorklog {
@@ -95,14 +94,9 @@ impl Worklog for FileWorklog {
         Ok(())
     }
 
-    fn get_task_names(&self) -> Result<Vec<WorklogTask>> {
+    fn get_recent_tasks(&self) -> Vec<WorklogTask> {
         // Implementacja pobierania nazw zadań z pliku
-        Ok(vec![])
-    }
-
-    fn get_top_tasks(&self) -> Result<Vec<WorklogTask>> {
-        // Implementacja pobierania najważniejszych zadań z pliku
-        Ok(vec![])
+        vec![]
     }
 }
 
@@ -181,14 +175,17 @@ impl Worklog for RemoteWorklog {
         Ok(())
     }
 
-    fn get_task_names(&self) -> Result<Vec<WorklogTask>> {
-        // Implementacja pobierania nazw zadań z pliku
-        Ok(vec![])
-    }
-
-    fn get_top_tasks(&self) -> Result<Vec<WorklogTask>> {
-        // Implementacja pobierania najważniejszych zadań z pliku
-        Ok(vec![])
+    fn get_recent_tasks(&self) ->Vec<WorklogTask> {
+        vec![
+            WorklogTask {
+                name: "Podłączenie do silverbullet: pobieranie listy tasków/tagów, pobieranie zaplanowanych zadań".to_string(),
+                tag: "Focus-watchdog@3181".to_string(),
+            },
+            WorklogTask {
+                name: "Lista do wprowadzania nazwy zadania i taga. Pamiętająca poprzednie stringi".to_string(),
+                tag: "Focus-watchdog@1259".to_string(),
+            },
+        ]
     }
 }
 
@@ -208,14 +205,9 @@ impl Worklog for DummyWorklog {
         Ok(())
     }
 
-    fn get_task_names(&self) -> Result<Vec<WorklogTask>> {
+    fn get_recent_tasks(&self) -> Vec<WorklogTask> {
         // Implementacja pobierania nazw zadań z pliku
-        Ok(vec![])
-    }
-
-    fn get_top_tasks(&self) -> Result<Vec<WorklogTask>> {
-        // Implementacja pobierania najważniejszych zadań z pliku
-        Ok(vec![])
+        vec![]
     }
 }
 
