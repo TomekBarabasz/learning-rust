@@ -13,6 +13,5 @@ robimy plik focus-watchdog.toml
 ## podawanie ścieżki do ffmpeg
 podczas builda animacje są konwertowane do rozmiaru EMBED_SIZE w build.rs
 - windows:
-    set NOPE_FFMPEG="C:\\tomek\\ffmpeg-2026-08-17\\bin\\ffmpeg.exe"
+    set NOPE_FFMPEG=C:\\tomek\\ffmpeg-2026-08-17\\bin\\ffmpeg.exe
 - linux: .. ?
-

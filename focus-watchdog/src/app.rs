@@ -107,7 +107,7 @@ impl Dialog {
         if self.suggestions.is_empty() {
             return;
         }
-        
+
         fn suggestion_label(task: &WorklogTask) -> String {
             if task.tag.is_empty() {
                 task.name.clone()
@@ -428,7 +428,7 @@ impl App {
             max_width: NAME_WIDTH,
             max_rows: 3,
             // Długie słowo bez spacji ma się złamać, a nie wyjechać poza okno.
-            break_anywhere: true,
+            break_anywhere: false,
             ..Default::default()
         };
 

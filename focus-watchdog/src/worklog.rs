@@ -4,13 +4,16 @@ use std::{fs::File, fs::OpenOptions, io::Write, path::PathBuf};
 use chrono::Local;
 use std::time::Duration;
 use serde_json::Value;
+use serde::Deserialize;
 
 use crate::config::AppConfig;
 use crate::task::Task;
 use crate::utils::to_minutes;
 
+#[derive(Debug, Deserialize)]
 pub struct WorklogTask {
     pub name: String,
+    #[serde(rename = "ref")]
     pub tag: String,
 }
 
@@ -114,26 +117,7 @@ impl RemoteWorklog {
                                     .expect("Failed to build HTTP client") 
         }
     }
-}
-
-impl Worklog for RemoteWorklog {
-    fn get_name(&self) -> String {
-        format!("Logowanie na serwer {}",self.url)
-    }
-    fn add_record(&mut self, task: &Task) -> Result<()> {
-        // TODO: sprawdzić w sb-client jak to zformatować poprawnie żeby Lua się nie pluło
-        let record = format!(
-            "{},{},{},{},{},{},{}",
-            task.started_at.format(DATE_FMT),
-            Local::now().format(DATE_FMT),
-            csv_field(&task.name),
-            csv_field(&task.tag),
-            to_minutes(task.minimum),
-            to_minutes(task.worked()),
-            to_minutes(task.paused_time()),
-        );
-        let expr = format!("worklog.addCsv({})", serde_json::Value::String(record));
-        log::info!("sending expression {:?}",expr);
+    fn send_expression(&self, expr : String) -> Result<Value> {
         let endpoint = format!("{}/.runtime/lua",self.url.trim_end_matches('/'));
         let req = self.client
             .post(&endpoint)
@@ -172,20 +156,60 @@ impl Worklog for RemoteWorklog {
             log::error!("{}",error_msg);
             bail!(error_msg);
         }
+        body.get("result")
+        .cloned()
+        .context("odpowiedź serwera nie zawiera pola `result`")
+    }
+
+    /// Konwertuje pole "result" odpowiedzi na listę zadań.
+    /// Akceptuje tablicę, pojedynczy obiekt oraz `{empty=true}` / null jako pustą listę.
+    fn to_tasks(result: &Value) -> Result<Vec<WorklogTask>> {
+        match result {
+            Value::Null => Ok(Vec::new()),
+            Value::Array(_) => serde_json::from_value(result.clone())
+                .context("nieoczekiwany kształt listy zadań"),
+            Value::Object(map) => {
+                if map.get("empty").and_then(Value::as_bool) == Some(true) {
+                    return Ok(Vec::new());
+                }
+                let one: WorklogTask = serde_json::from_value(result.clone())
+                    .context("nieoczekiwany kształt zadania")?;
+                Ok(vec![one])
+            }
+            other => anyhow::bail!("oczekiwano obiektu albo tablicy, dostano: {other}"),
+        }
+    }
+}
+
+impl Worklog for RemoteWorklog {
+    fn get_name(&self) -> String {
+        format!("Logowanie na serwer {}",self.url)
+    }
+
+    fn add_record(&mut self, task: &Task) -> Result<()> {
+        // TODO: sprawdzić w sb-client jak to zformatować poprawnie żeby Lua się nie pluło
+        let record = format!(
+            "{},{},{},{},{},{},{}",
+            task.started_at.format(DATE_FMT),
+            Local::now().format(DATE_FMT),
+            csv_field(&task.name),
+            csv_field(&task.tag),
+            to_minutes(task.minimum),
+            to_minutes(task.worked()),
+            to_minutes(task.paused_time()),
+        );
+        let expr = format!("worklog.addCsv({})", serde_json::Value::String(record));
+        let _result = self.send_expression(expr);
         Ok(())
     }
 
-    fn get_recent_tasks(&self) ->Vec<WorklogTask> {
-        vec![
-            WorklogTask {
-                name: "Podłączenie do silverbullet: pobieranie listy tasków/tagów, pobieranie zaplanowanych zadań".to_string(),
-                tag: "Focus-watchdog@3181".to_string(),
-            },
-            WorklogTask {
-                name: "Lista do wprowadzania nazwy zadania i taga. Pamiętająca poprzednie stringi".to_string(),
-                tag: "Focus-watchdog@1259".to_string(),
-            },
-        ]
+    fn get_recent_tasks(&self) -> Vec<WorklogTask> {
+        let expr = "mytask.getNextTasks(10)";
+        let result = self.send_expression(expr.to_string());
+        match result {
+            Ok(value) => RemoteWorklog::to_tasks(&value).unwrap_or_default(),
+            Err(_) => vec![],
+        }
     }
 }
 
