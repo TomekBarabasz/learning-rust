@@ -1,4 +1,5 @@
 // Ukryj konsolę w buildzie release na Windows (w debug zostaje - przydaje się do logów).
+// to robi build windowsowy, bez okienka - nie da się zrobić println! - ale tylko w release - w debug jest!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
@@ -8,6 +9,7 @@ mod resource;
 mod app;
 mod task;
 
+use std::path::PathBuf;
 use eframe::egui;
 use std::env;
 use app::App;
@@ -16,19 +18,12 @@ static APP_NAME: &str = "Focus Watchdog";
 static APP_TITLE: &str = "Nope, Finish This First!";
 
 fn main() -> eframe::Result {
-    let config = config::load_config( env::args().nth(1).as_deref());
-
-    // Loadery egui zgłaszają błędy przez `log`. Bez zainicjowanego loggera
-    // komunikaty typu "nie znalazłem pliku" znikają w próżni.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let window_size = config
-        .as_ref()
-        .and_then(|c| c.window_size)
-        .unwrap_or((640.0, 240.0));
+    init_logging();
+    log::info!("Starging {APP_NAME}");
+    let config = config::load_config(env::args().nth(1).as_deref());
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size(window_size)
+        .with_inner_size(config.as_ref().unwrap().window_size)
         .with_resizable(false)
         .with_maximize_button(false)
         .with_title(APP_TITLE);
@@ -59,4 +54,37 @@ fn main() -> eframe::Result {
             Ok(Box::new(App::new(&cc.egui_ctx, worklog, config.unwrap_or_default())))
         }),
     )
+}
+
+/// Konfiguruje `log`. Poziom sterowany zmienną RUST_LOG, domyślnie `info`.
+///
+/// W debug piszemy na stderr (konsola jest widoczna).
+/// W release konsoli nie ma - `windows_subsystem = "windows"` ją odcina,
+/// więc stderr trafiałby w próżnię. Dlatego log idzie do pliku obok exe.
+fn init_logging() {
+
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    builder.format_timestamp_secs();
+    #[cfg(not(debug_assertions))]
+    if let Some(path) = log_file_path() {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(err) => {
+                // Nie ma gdzie tego zgłosić - logger jeszcze nie działa.
+                eprintln!("nie mogę otworzyć logu {}: {err}", path.display());
+            }
+        }
+    }
+    builder.init();
+}
+/// Plik logu obok pliku wykonywalnego.
+#[cfg(not(debug_assertions))]
+fn log_file_path() -> Option<PathBuf> {
+    Some(env::current_exe().ok()?.with_extension("log"))
 }

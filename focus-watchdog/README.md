@@ -5,3 +5,7 @@ robimy plik focus-watchdog.toml
     token = "my silverbuilet api token"
     worklog_file = "filename" [optional]
     window_size = [640,240] [optional]
+
+# takie tam
+## konwersja webp na gif
+`ffmpeg -i <file>.webp -loop 0 <file>.gif`

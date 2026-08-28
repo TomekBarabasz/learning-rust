@@ -178,9 +178,11 @@ impl Worklog for DummyWorklog {
 pub fn make_worklog(config : Option<AppConfig>) -> Result<Box<dyn Worklog>> {
     if let Some(cfg) = config {
         if let (Some(url), Some(token)) = (cfg.url, cfg.token) {
+            log::info!("Using server worklog, url = {}",url);
             return Ok(Box::new(RemoteWorklog::new(url, token)));
         } else if let Some(worklog_file) = cfg.worklog_file {
             let path = PathBuf::from(worklog_file);
+            log::info!("Using file worklog, path = {:?}",path.clone());
             let worklog = FileWorklog::new(path)?;
             return Ok(Box::new(worklog));
         }
