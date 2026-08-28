@@ -173,7 +173,7 @@ impl eframe::App for App {
 
         // Awaryjne przywracanie okna, jeśli mimo wyłączonego przycisku
         // zostało zminimalizowane skrótem systemowym.
-        if self.config.force_restore && matches!(self.state, SessionState::Working(_)) {
+        if cfg!(feature = "kiosk") && matches!(self.state, SessionState::Working(_)) {
             if ctx.input(|i| i.viewport().minimized) == Some(true) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }

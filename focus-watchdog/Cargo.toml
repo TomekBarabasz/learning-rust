@@ -23,3 +23,9 @@ winresource = "0.1"
 [profile.release]
 opt-level = 2
 strip = true
+
+[features]
+default = []
+# Wymusza przywracanie okna w trybie working, gdy zostanie zminimalizowane
+# skrótem systemowym (Win+D, Win+M) mimo wyłączonego przycisku.
+kiosk = []

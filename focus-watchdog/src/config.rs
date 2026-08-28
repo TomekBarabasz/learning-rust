@@ -14,10 +14,6 @@ pub struct AppConfig {
     pub window_size: (f32, f32),
     pub button_height: f32,
     pub text_size: f32,
-    /// Czy w trybie working natychmiast przywracać okno, gdy jednak zostanie
-    /// zminimalizowane (np. przez Win+D albo Win+M, których przycisk nie blokuje).
-    /// Domyślnie wyłączone - walczenie z użytkownikiem o okno bywa irytujące.
-    pub force_restore: bool,
     pub anim_size: f32,
     pub extend_options: Vec<u32>,
     pub overtime_color: (u8, u8, u8),
@@ -32,7 +28,6 @@ impl Default for AppConfig {
             worklog_file: None,
             button_height: 28.0,
             text_size: 20.0,
-            force_restore: false,
             anim_size: 200.0,
             extend_options: vec![15, 30, 45],
             overtime_color: (46, 160, 67),
