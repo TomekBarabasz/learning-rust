@@ -1,5 +1,4 @@
-
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::egui;
 
 /// Animacja wczytana do pamięci albo informacja, czemu się nie udało.
@@ -12,30 +11,67 @@ pub struct Anim {
 }
 
 // Animacje wkompilowane w binarkę na etapie 'cargo build'.
+// Tablica EMBEDDED trzyma pary (nazwa_pliku_z_rozszerzeniem, bajty).
 
 include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 
 /// Ikona okna (pasek zadań, Alt+Tab). Kwadratowy PNG, najlepiej 256x256.
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
+/// Rozszerzenia sprawdzane na dysku, w kolejności preferencji.
+const EXTENSIONS: [&str; 3] = ["webp", "gif", "png"];
+
 /// Wczytuje animację o podanej nazwie bazowej.
 ///
-/// Kolejność: najpierw plik z dysku (obok exe, potem w katalogu roboczym,
-/// rozszerzenia .webp / .gif / .png), a jeśli go nie ma - wersja wkompilowana
-/// w binarkę. Dzięki temu domyślnie wystarczy sam exe, ale można podmienić
-/// animację bez rekompilacji, wrzucając plik do `assets/` obok niego.
+/// Kolejność: najpierw plik z dysku (obok exe, potem w katalogu roboczym),
+/// a jeśli go nie ma - wersja wkompilowana w binarkę. Dzięki temu domyślnie
+/// wystarczy sam exe, ale można podmienić animację bez rekompilacji,
+/// wrzucając plik do `assets/` obok niego.
 ///
 /// # Panics
 ///
 /// Funkcja nie panikuje.
-///
-/// Bajty trafiają wprost do cache egui pod URI `bytes://nazwa.rozszerzenie`.
-/// Dzięki temu omijamy loader `file://` i całą zabawę ze ścieżkami na Windows -
-/// plik czytamy sami i od razu wiemy, czy się udało.
 pub fn load_anim(ctx: &egui::Context, stem: &str) -> Anim {
-    const EXTENSIONS: [&str; 3] = ["webp", "gif", "png"];
+    let mut tried = Vec::new();
 
+    if let Some(anim) = load_from_disk(ctx, stem, &mut tried) {
+        return anim;
+    }
+
+    if let Some(anim) = load_embedded(ctx, stem) {
+        return anim;
+    }
+
+    missing_anim(stem, &tried)
+}
+
+fn load_from_disk(ctx: &egui::Context, stem: &str, tried: &mut Vec<String>) -> Option<Anim> {
+    for dir in asset_dirs() {
+        for ext in EXTENSIONS {
+            let path = dir.join(format!("{stem}.{ext}"));
+
+            match read_candidate(&path) {
+                Ok(Some(bytes)) => {
+                    log::info!("Wczytano {} ({} bajtów)", path.display(), bytes.len());
+                    return Some(publish_bytes(ctx, &format!("{stem}.{ext}"), bytes));
+                }
+                Ok(None) => tried.push(path.display().to_string()),
+                Err(err) => {
+                    log::error!("Nie mogę przeczytać {}: {err}", path.display());
+                    tried.push(format!("{} ({err})", path.display()));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Katalogi z animacjami: obok exe i w katalogu roboczym.
+/// Bardzo często to ten sam folder - bez dedup log robi się dwa razy dłuższy.
+fn asset_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             dirs.push(dir.join("assets"));
@@ -45,46 +81,66 @@ pub fn load_anim(ctx: &egui::Context, stem: &str) -> Anim {
         dirs.push(cwd.join("assets"));
     }
 
-    let mut tried: Vec<String> = Vec::new();
+    dirs.dedup();
+    dirs
+}
 
-    for dir in &dirs {
-        for ext in EXTENSIONS {
-            let path = dir.join(format!("{stem}.{ext}"));
-            if !path.is_file() {
-                tried.push(path.display().to_string());
-                continue;
-            }
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let uri = format!("bytes://{stem}.{ext}");
-                    log::info!(
-                        "Wczytano {} ({} bajtów) jako {uri}",
-                        path.display(),
-                        bytes.len()
-                    );
-                    ctx.include_bytes(uri.clone(), bytes);
-                    return Anim { uri, error: None };
-                }
-                Err(err) => {
-                    log::error!("Nie mogę przeczytać {}: {err}", path.display());
-                    tried.push(format!("{} ({err})", path.display()));
-                }
-            }
-        }
+/// `Ok(None)` = pliku po prostu nie ma, `Err` = jest, ale nie da się przeczytać.
+fn read_candidate(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    if !path.is_file() {
+        return Ok(None);
     }
 
-    // Nic na dysku - użyj wersji wkompilowanej w binarkę.
-    for (name, bytes) in EMBEDDED {
-        if *name == stem {
-            let uri = format!("bytes://{stem}");
-            log::info!("Używam wbudowanej animacji {uri} ({} bajtów)", bytes.len());
-            ctx.include_bytes(uri.clone(), *bytes);
-            return Anim { uri, error: None };
-        }
-    }
+    std::fs::read(path).map(Some)
+}
 
-    let msg = format!("Brak pliku {stem}.(webp|gif|png).\nSzukałem w:\n{}", tried.join("\n"));
+fn load_embedded(ctx: &egui::Context, stem: &str) -> Option<Anim> {
+    let (file_name, bytes) = find_embedded(stem)?;
+
+    log::info!(
+        "Używam wbudowanej animacji {file_name} ({} bajtów)",
+        bytes.len()
+    );
+
+    Some(publish_bytes(ctx, file_name, bytes))
+}
+
+/// EMBEDDED trzyma nazwy z rozszerzeniem ("idle.gif"), a wołamy po stemie
+/// ("idle") - stąd porównanie po samej nazwie bazowej.
+fn find_embedded(stem: &str) -> Option<(&'static str, &'static [u8])> {
+    EMBEDDED
+        .iter()
+        .copied()
+        .find(|(file_name, _)| file_stem_of(file_name) == stem)
+}
+
+fn file_stem_of(file_name: &str) -> &str {
+    file_name.rsplit_once('.').map_or(file_name, |(stem, _)| stem)
+}
+
+/// Bajty trafiają wprost do cache egui pod URI `bytes://nazwa.rozszerzenie`.
+/// Rozszerzenie w URI jest obowiązkowe - po nim egui dobiera dekoder.
+///
+/// `impl Into<Bytes>` pozwala oddać zarówno `Vec<u8>` z dysku, jak i
+/// `&'static [u8]` z sekcji danych binarki - to drugie bez kopiowania.
+fn publish_bytes(
+    ctx: &egui::Context,
+    file_name: &str,
+    bytes: impl Into<egui::load::Bytes>,
+) -> Anim {
+    let uri = format!("bytes://{file_name}");
+    ctx.include_bytes(uri.clone(), bytes);
+
+    Anim { uri, error: None }
+}
+
+fn missing_anim(stem: &str, tried: &[String]) -> Anim {
+    let msg = format!(
+        "Brak pliku {stem}.(webp|gif|png).\nSzukałem w:\n{}",
+        tried.join("\n")
+    );
     log::error!("{msg}");
+
     Anim {
         uri: String::new(),
         error: Some(msg),
