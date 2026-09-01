@@ -29,6 +29,7 @@ struct Actions {
     toggle_pause: bool,
     extend: Option<u64>,
     abort: bool,
+    set_save_log: Option<bool>,
 }
 
 const NAME_FIELD_WIDTH: f32 = 380.0;
@@ -249,6 +250,7 @@ pub struct App {
     overtime_anim: Anim,
     pause_anim: Anim,
     worklog: Box<dyn Worklog>,
+    save_to_log: bool
 }
 
 impl App {
@@ -262,6 +264,7 @@ impl App {
             overtime_anim: load_anim(ctx, "overtime"),
             pause_anim: load_anim(ctx, "pause"),
             worklog,
+            save_to_log: true
         }
     }
 
@@ -487,6 +490,10 @@ impl App {
         if view.overtime {
             self.draw_extend_combo(ui, act);
         }
+        let mut save = self.save_to_log;
+        if ui.checkbox(&mut save, "zapisz").changed() {
+            act.set_save_log = Some(save);
+        }
     }
 
     fn draw_extend_combo(&self, ui: &mut egui::Ui, act: &mut Actions) {
@@ -536,6 +543,7 @@ impl App {
     fn apply(&mut self, ctx: &egui::Context, act: Actions) {
         self.apply_dialog(ctx, &act);
         self.apply_task(ctx, &act);
+        self.apply_log(ctx, &act);
     }
 
     fn apply_dialog(&mut self, ctx: &egui::Context, act: &Actions) {
@@ -601,15 +609,23 @@ impl App {
         }
     }
 
+    fn apply_log(&mut self, _ctx: &egui::Context, act: &Actions) {
+        if let Some(save) = act.set_save_log {
+            self.save_to_log = save;
+        }
+    }
+
     /// Zapis PRZED zmianą stanu - potem zadania już nie ma.
     fn finish_task(&mut self, ctx: &egui::Context) {
-        if let SessionState::Working(t) = &self.state {
-            match self.worklog.add_record(t) {
-                Ok(()) => {
-                    log::info!("zapisano do logu");
-                }
-                Err(err) => {
-                    log::error!("zapis do logu nieudany: {err}");
+        if self.save_to_log {
+            if let SessionState::Working(t) = &self.state {
+                match self.worklog.add_record(t) {
+                    Ok(()) => {
+                        log::info!("zapisano do logu");
+                    }
+                    Err(err) => {
+                        log::error!("zapis do logu nieudany: {err}");
+                    }
                 }
             }
         }
